@@ -9,8 +9,6 @@ on:
   push:
     branches:
       - development
-      - staging
-      - production
 
 permissions:
   contents: read
