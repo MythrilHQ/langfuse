@@ -77,10 +77,26 @@ jobs:
               if path not in blocked_rule:
                   raise SystemExit(f"Blocked-path router is missing {path}")
 
-          for service_name, service in services.items():
-              for port in service.get("ports", []):
-                  if port.get("host_ip") != "127.0.0.1":
-                      raise SystemExit(f"{service_name} publishes a non-loopback host port")
+          web_ports = web.get("ports", [])
+          if len(web_ports) != 1:
+              raise SystemExit("langfuse-web must publish exactly one loopback health-check port")
+          web_port = web_ports[0]
+          if (
+              web_port.get("host_ip") != "127.0.0.1"
+              or web_port.get("target") != 3000
+              or str(web_port.get("published")) != "3000"
+          ):
+              raise SystemExit("langfuse-web must publish only 127.0.0.1:3000:3000")
+
+          internal_services = {"langfuse-worker", "clickhouse", "minio", "redis", "postgres"}
+          exposed_internal_services = sorted(
+              service_name for service_name in internal_services
+              if services[service_name].get("ports")
+          )
+          if exposed_internal_services:
+              raise SystemExit(
+                  "Internal services must not publish host ports: " + ", ".join(exposed_internal_services)
+              )
           PY
 
       - name: Lint

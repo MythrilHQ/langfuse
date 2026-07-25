@@ -1,4 +1,19 @@
 services:
+  langfuse-worker:
+    ports: !reset []
+
+  clickhouse:
+    ports: !reset []
+
+  minio:
+    ports: !reset []
+
+  redis:
+    ports: !reset []
+
+  postgres:
+    ports: !reset []
+
   langfuse-web:
     networks:
       - default
