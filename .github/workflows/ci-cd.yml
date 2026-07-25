@@ -58,6 +58,7 @@ jobs:
           web = services["langfuse-web"]
           environment = web["environment"]
           expected = {
+              "HOSTNAME": "0.0.0.0",
               "AUTH_DISABLE_SIGNUP": "true",
               "AUTH_SESSION_MAX_AGE": "720",
               "LANGFUSE_CSP_ENFORCE_HTTPS": "true",
