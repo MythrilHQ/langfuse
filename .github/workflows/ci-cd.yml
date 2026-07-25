@@ -45,7 +45,43 @@ jobs:
         env:
           LANGFUSE_HOSTNAME: langfuse.example.test
           TRAEFIK_ROUTER_NAME: langfuse-ci
-        run: docker compose -f docker-compose.yml -f docker-compose.traefik.yml config --quiet
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.yml -f docker-compose.traefik.yml config --format json > "$RUNNER_TEMP/langfuse-compose.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config = json.loads(Path(os.environ["RUNNER_TEMP"], "langfuse-compose.json").read_text())
+          services = config["services"]
+          web = services["langfuse-web"]
+          environment = web["environment"]
+          expected = {
+              "AUTH_DISABLE_SIGNUP": "true",
+              "AUTH_SESSION_MAX_AGE": "720",
+              "LANGFUSE_CSP_ENFORCE_HTTPS": "true",
+              "LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES": "false",
+              "LANGFUSE_RATE_LIMITS_ENABLED": "true",
+              "TELEMETRY_ENABLED": "false",
+          }
+          for name, value in expected.items():
+              if str(environment.get(name)).lower() != value:
+                  raise SystemExit(f"langfuse-web must set {name}={value}")
+
+          labels = web["labels"]
+          if labels.get("traefik.http.routers.langfuse-ci-blocked.service") != "noop@internal":
+              raise SystemExit("Blocked-path router must terminate at noop@internal")
+          blocked_rule = labels.get("traefik.http.routers.langfuse-ci-blocked.rule", "")
+          for path in ("/auth/sign-up", "/api/auth/signup", "/setup", "/docs", "/swagger", "/openapi"):
+              if path not in blocked_rule:
+                  raise SystemExit(f"Blocked-path router is missing {path}")
+
+          for service_name, service in services.items():
+              for port in service.get("ports", []):
+                  if port.get("host_ip") != "127.0.0.1":
+                      raise SystemExit(f"{service_name} publishes a non-loopback host port")
+          PY
 
       - name: Lint
         run: pnpm run lint
@@ -117,6 +153,12 @@ jobs:
               "NEXTAUTH_SECRET",
               "SALT",
               "ENCRYPTION_KEY",
+              "AUTH_DISABLE_SIGNUP",
+              "AUTH_SESSION_MAX_AGE",
+              "LANGFUSE_CSP_ENFORCE_HTTPS",
+              "LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES",
+              "LANGFUSE_RATE_LIMITS_ENABLED",
+              "TELEMETRY_ENABLED",
               "LANGFUSE_HOSTNAME",
               "TRAEFIK_ROUTER_NAME",
               "CLICKHOUSE_PASSWORD",
@@ -137,6 +179,46 @@ jobs:
 
           if not re.fullmatch(r"[0-9a-fA-F]{64}", values["ENCRYPTION_KEY"]):
               raise SystemExit("ENCRYPTION_KEY must contain exactly 64 hexadecimal characters")
+
+          expected_hardening = {
+              "AUTH_DISABLE_SIGNUP": "true",
+              "LANGFUSE_CSP_ENFORCE_HTTPS": "true",
+              "LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES": "false",
+              "LANGFUSE_RATE_LIMITS_ENABLED": "true",
+              "TELEMETRY_ENABLED": "false",
+          }
+          invalid_hardening = sorted(
+              name for name, expected in expected_hardening.items()
+              if values.get(name).lower() != expected
+          )
+          if invalid_hardening:
+              raise SystemExit(
+                  "LANGFUSE_ENV_FILE has unsafe hardening values: " + ", ".join(invalid_hardening)
+              )
+
+          try:
+              session_max_age = int(values["AUTH_SESSION_MAX_AGE"])
+          except ValueError as error:
+              raise SystemExit("AUTH_SESSION_MAX_AGE must be an integer number of minutes") from error
+          if not 6 <= session_max_age <= 1440:
+              raise SystemExit("AUTH_SESSION_MAX_AGE must be between 6 and 1440 minutes")
+
+          minimum_secret_lengths = {
+              "NEXTAUTH_SECRET": 32,
+              "SALT": 32,
+              "CLICKHOUSE_PASSWORD": 24,
+              "REDIS_AUTH": 24,
+              "MINIO_ROOT_PASSWORD": 24,
+              "POSTGRES_PASSWORD": 24,
+          }
+          weak_secrets = sorted(
+              name for name, minimum_length in minimum_secret_lengths.items()
+              if len(values[name]) < minimum_length
+          )
+          if weak_secrets:
+              raise SystemExit(
+                  "LANGFUSE_ENV_FILE contains secrets below the minimum length: " + ", ".join(weak_secrets)
+              )
 
           public_url = urlparse(values["NEXTAUTH_URL"])
           if public_url.scheme != "https":
@@ -175,6 +257,17 @@ jobs:
             http://127.0.0.1:3000/api/public/health
           curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 5 \
             "${LANGFUSE_PUBLIC_URL%/}/api/public/health"
+
+          for blocked_path in /auth/sign-up /api/auth/signup /setup /docs /swagger /openapi; do
+            status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              "${LANGFUSE_PUBLIC_URL%/}${blocked_path}")
+            case "$status" in
+              2*|3*)
+                echo "Blocked path ${blocked_path} unexpectedly returned HTTP ${status}" >&2
+                exit 1
+                ;;
+            esac
+          done
 
       - name: Remove runtime environment file
         if: always()
