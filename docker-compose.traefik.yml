@@ -1,0 +1,20 @@
+services:
+  langfuse-web:
+    networks:
+      - default
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-proxy}"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.rule=Host(`${LANGFUSE_HOSTNAME}`)"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.entrypoints=websecure"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.tls=true"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.tls.certresolver=cloudflare"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.middlewares=security-headers@file"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.service=${TRAEFIK_ROUTER_NAME}"
+      - "traefik.http.services.${TRAEFIK_ROUTER_NAME}.loadbalancer.server.port=3000"
+
+networks:
+  proxy:
+    external: true
+    name: ${TRAEFIK_NETWORK:-proxy}

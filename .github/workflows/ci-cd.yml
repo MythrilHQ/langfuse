@@ -44,7 +44,10 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Validate Compose configuration
-        run: docker compose -f docker-compose.yml config --quiet
+        env:
+          LANGFUSE_HOSTNAME: langfuse.example.test
+          TRAEFIK_ROUTER_NAME: langfuse-ci
+        run: docker compose -f docker-compose.yml -f docker-compose.traefik.yml config --quiet
 
       - name: Lint
         run: pnpm run lint
@@ -103,6 +106,7 @@ jobs:
           import os
           import re
           from pathlib import Path
+          from urllib.parse import urlparse
 
           content = Path(".langfuse.env").read_text()
           values = {}
@@ -120,6 +124,8 @@ jobs:
               "NEXTAUTH_SECRET",
               "SALT",
               "ENCRYPTION_KEY",
+              "LANGFUSE_HOSTNAME",
+              "TRAEFIK_ROUTER_NAME",
               "CLICKHOUSE_PASSWORD",
               "LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID",
               "LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY",
@@ -139,10 +145,15 @@ jobs:
           if not re.fullmatch(r"[0-9a-fA-F]{64}", values["ENCRYPTION_KEY"]):
               raise SystemExit("ENCRYPTION_KEY must contain exactly 64 hexadecimal characters")
 
-          if not values["NEXTAUTH_URL"].startswith("https://"):
+          public_url = urlparse(values["NEXTAUTH_URL"])
+          if public_url.scheme != "https":
               raise SystemExit("NEXTAUTH_URL must use https://")
           if values["NEXTAUTH_URL"].rstrip("/") != os.environ["LANGFUSE_PUBLIC_URL"].rstrip("/"):
               raise SystemExit("NEXTAUTH_URL must match the LANGFUSE_PUBLIC_URL Environment variable")
+          if public_url.hostname != values["LANGFUSE_HOSTNAME"]:
+              raise SystemExit("LANGFUSE_HOSTNAME must match the NEXTAUTH_URL hostname")
+          if not re.fullmatch(r"[A-Za-z0-9_-]+", values["TRAEFIK_ROUTER_NAME"]):
+              raise SystemExit("TRAEFIK_ROUTER_NAME may contain only letters, numbers, underscores, and hyphens")
 
           minio_user = values["MINIO_ROOT_USER"]
           minio_password = values["MINIO_ROOT_PASSWORD"]
@@ -173,13 +184,14 @@ jobs:
           DEPLOY_SHA: ${{ github.sha }}
           GITHUB_DEPLOY_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          LANGFUSE_PUBLIC_URL: ${{ env.LANGFUSE_PUBLIC_URL }}
         with:
           host: ${{ env.DEPLOY_HOST }}
           port: ${{ env.DEPLOY_PORT }}
           username: ${{ env.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           fingerprint: ${{ env.DEPLOY_HOST_FINGERPRINT }}
-          envs: DEPLOY_PATH,DEPLOY_SHA,GITHUB_DEPLOY_TOKEN,GITHUB_REPOSITORY,LANGFUSE_ENV_B64
+          envs: DEPLOY_PATH,DEPLOY_SHA,GITHUB_DEPLOY_TOKEN,GITHUB_REPOSITORY,LANGFUSE_ENV_B64,LANGFUSE_PUBLIC_URL
           script: |
             set -eu
 
@@ -207,8 +219,10 @@ jobs:
             mv "$DEPLOY_PATH/.env.next" "$DEPLOY_PATH/.env"
 
             cd "$DEPLOY_PATH"
-            docker compose --env-file .env -f docker-compose.yml config --quiet
-            docker compose --env-file .env -f docker-compose.yml pull
-            docker compose --env-file .env -f docker-compose.yml up -d --wait --remove-orphans
+            docker compose --env-file .env -f docker-compose.yml -f docker-compose.traefik.yml config --quiet
+            docker compose --env-file .env -f docker-compose.yml -f docker-compose.traefik.yml pull
+            docker compose --env-file .env -f docker-compose.yml -f docker-compose.traefik.yml up -d --wait --remove-orphans
             curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 5 \
               http://127.0.0.1:3000/api/public/health
+            curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 5 \
+              "${LANGFUSE_PUBLIC_URL%/}/api/public/health"
