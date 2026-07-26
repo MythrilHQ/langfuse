@@ -74,7 +74,7 @@ services:
     restart: always
     depends_on: *langfuse-depends-on
     ports:
-      - 127.0.0.1:3000:3000
+      - "127.0.0.1:${LANGFUSE_WEB_HOST_PORT:-3000}:3000"
     environment:
       <<: *langfuse-worker-env
       HOSTNAME: 0.0.0.0
