@@ -1,0 +1,291 @@
+name: Langfuse CI/CD
+
+on:
+  pull_request:
+    branches:
+      - development
+      - staging
+      - production
+  push:
+    branches:
+      - development
+
+permissions:
+  contents: read
+
+concurrency:
+  group: langfuse-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_name != 'production' }}
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate GitHub Actions workflows
+        uses: docker://rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        with:
+          args: -color
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.10.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate Compose configuration
+        env:
+          LANGFUSE_HOSTNAME: langfuse.example.test
+          TRAEFIK_ROUTER_NAME: langfuse-ci
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.yml -f docker-compose.traefik.yml config --format json > "$RUNNER_TEMP/langfuse-compose.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config = json.loads(Path(os.environ["RUNNER_TEMP"], "langfuse-compose.json").read_text())
+          services = config["services"]
+          web = services["langfuse-web"]
+          environment = web["environment"]
+          expected = {
+              "HOSTNAME": "0.0.0.0",
+              "AUTH_DISABLE_SIGNUP": "true",
+              "AUTH_SESSION_MAX_AGE": "720",
+              "LANGFUSE_CSP_ENFORCE_HTTPS": "true",
+              "LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES": "false",
+              "LANGFUSE_RATE_LIMITS_ENABLED": "true",
+              "TELEMETRY_ENABLED": "false",
+          }
+          for name, value in expected.items():
+              if str(environment.get(name)).lower() != value:
+                  raise SystemExit(f"langfuse-web must set {name}={value}")
+
+          labels = web["labels"]
+          if labels.get("traefik.http.routers.langfuse-ci-blocked.service") != "noop@internal":
+              raise SystemExit("Blocked-path router must terminate at noop@internal")
+          blocked_rule = labels.get("traefik.http.routers.langfuse-ci-blocked.rule", "")
+          for path in ("/auth/sign-up", "/api/auth/signup", "/setup", "/docs", "/swagger", "/openapi"):
+              if path not in blocked_rule:
+                  raise SystemExit(f"Blocked-path router is missing {path}")
+
+          web_ports = web.get("ports", [])
+          if len(web_ports) != 1:
+              raise SystemExit("langfuse-web must publish exactly one loopback health-check port")
+          web_port = web_ports[0]
+          if (
+              web_port.get("host_ip") != "127.0.0.1"
+              or web_port.get("target") != 3000
+              or str(web_port.get("published")) != "3000"
+          ):
+              raise SystemExit("langfuse-web must publish only 127.0.0.1:3000:3000")
+
+          internal_services = {"langfuse-worker", "clickhouse", "minio", "redis", "postgres"}
+          exposed_internal_services = sorted(
+              service_name for service_name in internal_services
+              if services[service_name].get("ports")
+          )
+          if exposed_internal_services:
+              raise SystemExit(
+                  "Internal services must not publish host ports: " + ", ".join(exposed_internal_services)
+              )
+          PY
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+  deploy:
+    name: Deploy ${{ github.ref_name }}
+    if: github.event_name == 'push'
+    needs: validate
+    runs-on:
+      - self-hosted
+      - Linux
+      - ARM64
+      - langfuse-runner
+    environment:
+      name: ${{ github.ref_name }}
+      url: ${{ vars.LANGFUSE_PUBLIC_URL }}
+    env:
+      LANGFUSE_PUBLIC_URL: ${{ vars.LANGFUSE_PUBLIC_URL }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate deployment configuration
+        env:
+          LANGFUSE_ENV_FILE: ${{ secrets.LANGFUSE_ENV_FILE }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$LANGFUSE_PUBLIC_URL" ]; then
+            echo "Missing GitHub Environment variable: LANGFUSE_PUBLIC_URL" >&2
+            exit 1
+          fi
+          if [ -z "$LANGFUSE_ENV_FILE" ]; then
+            echo "Missing GitHub Environment secret: LANGFUSE_ENV_FILE" >&2
+            exit 1
+          fi
+
+      - name: Prepare protected runtime environment
+        env:
+          LANGFUSE_ENV_FILE: ${{ secrets.LANGFUSE_ENV_FILE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$LANGFUSE_ENV_FILE" > .env
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          content = Path(".env").read_text()
+          values = {}
+          for raw_line in content.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              key, separator, value = line.partition("=")
+              if separator:
+                  values[key.strip()] = value.strip().strip("\"'")
+
+          required = {
+              "DATABASE_URL",
+              "NEXTAUTH_URL",
+              "NEXTAUTH_SECRET",
+              "SALT",
+              "ENCRYPTION_KEY",
+              "AUTH_DISABLE_SIGNUP",
+              "AUTH_SESSION_MAX_AGE",
+              "LANGFUSE_CSP_ENFORCE_HTTPS",
+              "LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES",
+              "LANGFUSE_RATE_LIMITS_ENABLED",
+              "TELEMETRY_ENABLED",
+              "LANGFUSE_HOSTNAME",
+              "TRAEFIK_ROUTER_NAME",
+              "CLICKHOUSE_PASSWORD",
+              "LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID",
+              "LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY",
+              "LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID",
+              "LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY",
+              "REDIS_AUTH",
+              "MINIO_ROOT_USER",
+              "MINIO_ROOT_PASSWORD",
+              "POSTGRES_USER",
+              "POSTGRES_PASSWORD",
+              "POSTGRES_DB",
+          }
+          missing = sorted(name for name in required if not values.get(name))
+          if missing:
+              raise SystemExit(f"LANGFUSE_ENV_FILE is missing required values: {', '.join(missing)}")
+
+          if not re.fullmatch(r"[0-9a-fA-F]{64}", values["ENCRYPTION_KEY"]):
+              raise SystemExit("ENCRYPTION_KEY must contain exactly 64 hexadecimal characters")
+
+          expected_hardening = {
+              "AUTH_DISABLE_SIGNUP": "true",
+              "LANGFUSE_CSP_ENFORCE_HTTPS": "true",
+              "LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES": "false",
+              "LANGFUSE_RATE_LIMITS_ENABLED": "true",
+              "TELEMETRY_ENABLED": "false",
+          }
+          invalid_hardening = sorted(
+              name for name, expected in expected_hardening.items()
+              if values.get(name).lower() != expected
+          )
+          if invalid_hardening:
+              raise SystemExit(
+                  "LANGFUSE_ENV_FILE has unsafe hardening values: " + ", ".join(invalid_hardening)
+              )
+
+          try:
+              session_max_age = int(values["AUTH_SESSION_MAX_AGE"])
+          except ValueError as error:
+              raise SystemExit("AUTH_SESSION_MAX_AGE must be an integer number of minutes") from error
+          if not 6 <= session_max_age <= 1440:
+              raise SystemExit("AUTH_SESSION_MAX_AGE must be between 6 and 1440 minutes")
+
+          minimum_secret_lengths = {
+              "NEXTAUTH_SECRET": 32,
+              "SALT": 32,
+              "CLICKHOUSE_PASSWORD": 24,
+              "REDIS_AUTH": 24,
+              "MINIO_ROOT_PASSWORD": 24,
+              "POSTGRES_PASSWORD": 24,
+          }
+          weak_secrets = sorted(
+              name for name, minimum_length in minimum_secret_lengths.items()
+              if len(values[name]) < minimum_length
+          )
+          if weak_secrets:
+              raise SystemExit(
+                  "LANGFUSE_ENV_FILE contains secrets below the minimum length: " + ", ".join(weak_secrets)
+              )
+
+          public_url = urlparse(values["NEXTAUTH_URL"])
+          if public_url.scheme != "https":
+              raise SystemExit("NEXTAUTH_URL must use https://")
+          if values["NEXTAUTH_URL"].rstrip("/") != os.environ["LANGFUSE_PUBLIC_URL"].rstrip("/"):
+              raise SystemExit("NEXTAUTH_URL must match the LANGFUSE_PUBLIC_URL Environment variable")
+          if public_url.hostname != values["LANGFUSE_HOSTNAME"]:
+              raise SystemExit("LANGFUSE_HOSTNAME must match the NEXTAUTH_URL hostname")
+          if not re.fullmatch(r"[A-Za-z0-9_-]+", values["TRAEFIK_ROUTER_NAME"]):
+              raise SystemExit("TRAEFIK_ROUTER_NAME may contain only letters, numbers, underscores, and hyphens")
+
+          minio_user = values["MINIO_ROOT_USER"]
+          minio_password = values["MINIO_ROOT_PASSWORD"]
+          if values["LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID"] != minio_user:
+              raise SystemExit("Event-upload access key must match MINIO_ROOT_USER")
+          if values["LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID"] != minio_user:
+              raise SystemExit("Media-upload access key must match MINIO_ROOT_USER")
+          if values["LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY"] != minio_password:
+              raise SystemExit("Event-upload secret key must match MINIO_ROOT_PASSWORD")
+          if values["LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY"] != minio_password:
+              raise SystemExit("Media-upload secret key must match MINIO_ROOT_PASSWORD")
+
+          unsafe_values = {"mysecret", "mysalt", "minio", "miniosecret", "postgres", "clickhouse", "myredissecret"}
+          unsafe = sorted(name for name in required if values.get(name) in unsafe_values)
+          if unsafe:
+              raise SystemExit(f"LANGFUSE_ENV_FILE still uses unsafe default values: {', '.join(unsafe)}")
+          PY
+
+      - name: Deploy tested commit
+        run: |
+          set -euo pipefail
+          docker compose --env-file .env -f docker-compose.yml -f docker-compose.traefik.yml config --quiet
+          docker compose --env-file .env -f docker-compose.yml -f docker-compose.traefik.yml pull
+          docker compose --env-file .env -f docker-compose.yml -f docker-compose.traefik.yml up -d --wait --remove-orphans
+          curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 5 \
+            http://127.0.0.1:3000/api/public/health
+          curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 5 \
+            "${LANGFUSE_PUBLIC_URL%/}/api/public/health"
+
+          for blocked_path in /auth/sign-up /api/auth/signup /setup /docs /swagger /openapi; do
+            status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              "${LANGFUSE_PUBLIC_URL%/}${blocked_path}")
+            case "$status" in
+              2*|3*)
+                echo "Blocked path ${blocked_path} unexpectedly returned HTTP ${status}" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Remove runtime environment file
+        if: always()
+        run: rm -f .env
