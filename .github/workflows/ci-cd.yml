@@ -122,6 +122,7 @@ jobs:
       url: ${{ vars.LANGFUSE_PUBLIC_URL }}
     env:
       LANGFUSE_PUBLIC_URL: ${{ vars.LANGFUSE_PUBLIC_URL }}
+      TRAEFIK_CERT_RESOLVER: ${{ github.ref_name == 'production' && 'letsencrypt' || 'cloudflare' }}
       COMPOSE_PROJECT_NAME: ${{ github.ref_name == 'development' && 'langfuse' || github.ref_name == 'staging' && 'langfuse-staging' || 'langfuse-prod' }}
       LANGFUSE_WEB_HOST_PORT: ${{ github.ref_name == 'development' && '3000' || '3001' }}
     steps:
