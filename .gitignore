@@ -118,3 +118,5 @@ web/test-results/*
 
 # Superset config
 .superset/
+
+local/
