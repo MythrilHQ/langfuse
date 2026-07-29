@@ -24,7 +24,7 @@ services:
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.rule=Host(`${LANGFUSE_HOSTNAME}`)"
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.entrypoints=websecure"
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.tls=true"
-      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.tls.certresolver=cloudflare"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-cloudflare}"
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.middlewares=security-headers@file,${TRAEFIK_ROUTER_NAME}-hardening"
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}.service=${TRAEFIK_ROUTER_NAME}"
       - "traefik.http.services.${TRAEFIK_ROUTER_NAME}.loadbalancer.server.port=3000"
@@ -37,7 +37,7 @@ services:
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}-blocked.rule=Host(`${LANGFUSE_HOSTNAME}`) && (Path(`/auth/sign-up`) || PathPrefix(`/api/auth/signup`) || Path(`/setup`) || Path(`/doc`) || Path(`/ui`) || Path(`/docs`) || PathPrefix(`/docs/`) || Path(`/swagger`) || PathPrefix(`/swagger/`) || Path(`/swagger-ui`) || PathPrefix(`/swagger-ui/`) || Path(`/openapi`) || PathPrefix(`/openapi/`) || Path(`/redoc`) || PathPrefix(`/redoc/`))"
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}-blocked.entrypoints=websecure"
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}-blocked.tls=true"
-      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}-blocked.tls.certresolver=cloudflare"
+      - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}-blocked.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-cloudflare}"
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}-blocked.priority=1000"
       - "traefik.http.routers.${TRAEFIK_ROUTER_NAME}-blocked.service=noop@internal"
 
