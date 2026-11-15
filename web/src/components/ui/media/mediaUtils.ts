@@ -1,4 +1,4 @@
-import { MediaReferenceStringSchema } from "@langfuse/shared";
+import { MediaReferenceStringSchema, parseS3Uri } from "@langfuse/shared";
 
 const LANGFUSE_MEDIA_PREFIX = "@@@langfuseMedia:";
 const LANGFUSE_MEDIA_REFERENCE_PATTERN = /@@@langfuseMedia:[^@]*@@@/g;
@@ -75,6 +75,7 @@ export function classifyMediaValue(value: unknown) {
       contentType: parsed.data.type,
       mediaId: parsed.data.id,
       referenceString: parsed.data.referenceString,
+      source: parsed.data.source,
     };
   }
 
@@ -98,6 +99,14 @@ export function classifyMediaValue(value: unknown) {
     const contentType = mimeFromUrl(value);
     if (!contentType) return null;
     return { kind: "url" as const, contentType, src: value };
+  }
+
+  if (value.startsWith("s3://")) {
+    const parsed = parseS3Uri(value);
+    if (!parsed) return null;
+    const contentType = mimeFromPath(parsed.key);
+    if (!contentType) return null;
+    return { kind: "s3" as const, contentType, uri: value };
   }
 
   return null;
@@ -152,6 +161,10 @@ function mimeFromUrl(url: string) {
   } catch {
     return null;
   }
+  return mimeFromPath(pathname);
+}
+
+function mimeFromPath(pathname: string) {
   const ext = pathname.split(".").pop()?.toLowerCase();
   if (!ext || ext === pathname) return null;
   return URL_EXTENSION_TO_MIME[ext] ?? null;

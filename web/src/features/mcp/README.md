@@ -51,6 +51,8 @@ A complete list of tools can be seen under [mcp.reference.langfuse.com](https://
 
 ## Architecture
 
+MCP requests are limited to 4.5 MB and 50,000 object members/array elements combined.
+
 ### Stateless Design
 
 The Langfuse MCP server uses a **stateless per-request architecture**:
@@ -112,6 +114,8 @@ Clients like Claude Code can use these annotations to:
 
 All write operations should audit-log entries with before/after snapshots.
 
+Tools that return trace, observation, score or experiment data declare `accessAudit` on `defineTool` and report the returned rows through the handler's `audit` argument (`audit.refs`, `audit.count`). Each successful call is then recorded as an access event (`surface = mcp`, the tool name as route) for orgs that record access events, before the result is returned.
+
 ---
 
 # Connecting Clients
@@ -144,8 +148,10 @@ This outputs your BasicAuth token (e.g., `cGstbGYt...`).
 - If a reverse proxy forwards a different `Host` header than `NEXTAUTH_URL`,
   either preserve the public host at the proxy or set
   `LANGFUSE_MCP_ALLOWED_HOSTS` to a comma-separated list of exact additional
-  hostnames/origins accepted by the MCP endpoint. Wildcards and paths are not
-  supported.
+  hostnames/origins accepted by the MCP endpoint. Wildcard host patterns and
+  paths are not supported. To disable Host and Origin validation completely, set
+  `LANGFUSE_MCP_ALLOWED_HOSTS=*`. This is not recommended because it disables
+  DNS rebinding protection for the MCP endpoint.
 
 **Local Development:**
 

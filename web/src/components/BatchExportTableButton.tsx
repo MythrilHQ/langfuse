@@ -1,3 +1,4 @@
+/* eslint-disable @repo/no-abstracted-overlay-trigger */
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -8,8 +9,8 @@ import {
   DropdownMenuLabel,
 } from "@/src/components/ui/dropdown-menu";
 import { Button } from "@/src/components/ui/button";
-import Spinner from "@/src/components/design-system/Spinner/Spinner";
-import { Download, Info } from "lucide-react";
+import { Spinner } from "@/src/components/design-system/Spinner/Spinner";
+import { Download, Info } from "@langfuse/icons";
 import {
   type BatchExportTableName,
   exportOptions,
@@ -20,7 +21,6 @@ import {
 import React from "react";
 import { api } from "@/src/utils/api";
 import { showSuccessToast } from "@/src/features/notifications/showSuccessToast";
-import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 
 export type BatchExportTableButtonProps = {
   projectId: string;
@@ -29,6 +29,7 @@ export type BatchExportTableButtonProps = {
   filterState: any;
   searchQuery?: any;
   searchType?: any;
+  disabledReason?: string;
 };
 
 export const BatchExportTableButton: React.FC<BatchExportTableButtonProps> = (
@@ -41,6 +42,7 @@ export const BatchExportTableButton: React.FC<BatchExportTableButtonProps> = (
     },
     onSuccess: () => {
       showSuccessToast({
+        operation: "export.queue",
         title: "Export queued",
         description: "You will receive an email when the export is ready.",
         duration: 10000,
@@ -51,11 +53,6 @@ export const BatchExportTableButton: React.FC<BatchExportTableButtonProps> = (
       });
     },
   });
-  const hasAccess = useHasProjectAccess({
-    projectId: props.projectId,
-    scope: "batchExports:create",
-  });
-
   const handleExport = async (format: BatchExportFileFormat) => {
     setIsExporting(true);
     await createExport.mutateAsync({
@@ -71,8 +68,6 @@ export const BatchExportTableButton: React.FC<BatchExportTableButtonProps> = (
       },
     });
   };
-
-  if (!hasAccess) return null;
 
   const getWarningMessage = () => {
     switch (props.tableName) {
@@ -97,11 +92,16 @@ export const BatchExportTableButton: React.FC<BatchExportTableButtonProps> = (
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" size="icon" title="Export">
+        <Button
+          variant="ghost"
+          size="icon"
+          title="Export"
+          className="hidden md:inline-flex"
+        >
           {isExporting ? (
             <Spinner size="sm" />
           ) : (
-            <Download className="h-4 w-4" />
+            <Download size="base" color="default" />
           )}
         </Button>
       </DropdownMenuTrigger>
@@ -111,21 +111,27 @@ export const BatchExportTableButton: React.FC<BatchExportTableButtonProps> = (
           {warningMessage && (
             <div className="text-muted-foreground px-2 py-1.5 text-xs">
               <div className="flex items-start gap-1.5">
-                <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <Info size="base" __rawClassName="mt-0.5" />
                 <span>{warningMessage}</span>
               </div>
             </div>
           )}
           <DropdownMenuSeparator />
-          {Object.entries(exportOptions).map(([key, options]) => (
-            <DropdownMenuItem
-              key={key}
-              className="capitalize"
-              onClick={() => handleExport(key as BatchExportFileFormat)}
-            >
-              as {options.label}
-            </DropdownMenuItem>
-          ))}
+          {props.disabledReason ? (
+            <div className="text-muted-foreground px-2 py-1.5 text-sm">
+              {props.disabledReason}
+            </div>
+          ) : (
+            Object.entries(exportOptions).map(([key, options]) => (
+              <DropdownMenuItem
+                key={key}
+                className="capitalize"
+                onClick={() => handleExport(key as BatchExportFileFormat)}
+              >
+                as {options.label}
+              </DropdownMenuItem>
+            ))
+          )}
         </DropdownMenuContent>
       </DropdownMenuPortal>
     </DropdownMenu>

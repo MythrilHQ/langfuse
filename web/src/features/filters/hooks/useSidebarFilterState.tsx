@@ -1,5 +1,12 @@
-import type React from "react";
-import { useCallback, useMemo, useEffect, useRef, useState } from "react";
+/* eslint-disable no-nested-ternary */
+import {
+  type default as React,
+  useCallback,
+  useMemo,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   StringParam,
   useQueryParam,
@@ -10,13 +17,11 @@ import {
   singleFilter,
   type SingleValueOption,
   type ColumnDefinition,
-} from "@langfuse/shared";
-import {
   computeSelectedValues,
   encodeFiltersGeneric,
   decodeFiltersGeneric,
   MAX_URL_FILTER_QUERY_LENGTH,
-} from "../lib/filter-query-encoding";
+} from "@langfuse/shared";
 import {
   buildSidebarFilterQueryStorageKey,
   createPersistedSidebarFilterQueryState,
@@ -27,7 +32,8 @@ import { normalizeFilterColumnNames } from "../lib/filter-transform";
 import {
   buildEffectiveEnvironmentFilter,
   buildManagedEnvironmentPolicyConfig,
-  stripImplicitEnvironmentFilterFromExplicitState,
+  canonicalizeExplicitEnvironmentFilters,
+  toSearchBarEnvironmentFilters,
   type ManagedEnvironmentPolicyInput,
 } from "../lib/managedEnvironmentPolicy";
 import { useKeyedSessionStorageState } from "./useKeyedSessionStorageState";
@@ -42,6 +48,8 @@ import {
   buildOnlySelection,
   clearCategoricalColumn,
   deriveOperatorChange,
+  hasMultipleFilterTargets,
+  hasEmptyCheckboxSelection,
   removeColumnFiltersOfType,
   removeTextFilterEntry,
   type BooleanKeyValueFilterEntry,
@@ -54,7 +62,7 @@ import {
 
 // Re-exported so existing consumers (tests, session view) keep their path.
 export { resolveCheckboxOperator } from "../lib/sidebar-filter-actions";
-import type { PeekTableStateContextValue } from "@/src/components/table/peek/contexts/PeekTableStateContext";
+import type { PeekTableStateContextValue } from "@/src/components/table/peek/contexts/PeekTableStateProvider";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 
 /**
@@ -119,31 +127,22 @@ export function decodeAndNormalizeFilters(
 }
 
 function computeNumericRange(
-  column: string,
-  filterState: FilterState,
+  conditions: NumericUIFilter["conditions"],
   defaultMin: number,
   defaultMax: number,
-): [number, number] {
-  const minFilter = filterState.find(
-    (f) => f.column === column && f.type === "number" && f.operator === ">=",
-  );
-  const maxFilter = filterState.find(
-    (f) => f.column === column && f.type === "number" && f.operator === "<=",
-  );
-
-  const minValue =
-    minFilter && typeof minFilter.value === "number"
-      ? minFilter.value
-      : defaultMin;
-  const maxValue =
-    maxFilter && typeof maxFilter.value === "number"
-      ? maxFilter.value
-      : defaultMax;
-
-  return [minValue, maxValue];
+): [number, number] | null {
+  if (conditions.length === 0) return [defaultMin, defaultMax];
+  // The range editor writes exactly one inclusive lower and upper bound.
+  // Other shapes must retain their operators and every separate condition.
+  if (conditions.length !== 2) return null;
+  const minFilter = conditions.find((filter) => filter.operator === ">=");
+  const maxFilter = conditions.find((filter) => filter.operator === "<=");
+  if (!minFilter || !maxFilter || minFilter.value > maxFilter.value)
+    return null;
+  return [minFilter.value, maxFilter.value];
 }
 
-export interface BaseUIFilter {
+interface BaseUIFilter {
   column: string;
   label: string;
   tooltip?: string;
@@ -178,6 +177,10 @@ export interface CategoricalUIFilter extends BaseUIFilter {
   onOnlyChange?: (value: string) => void;
   /** Optional function to render an icon next to filter option labels */
   renderIcon?: (value: string) => React.ReactNode;
+  /** Optional content rendered after a filter option label */
+  renderOptionSuffix?: (value: string) => React.ReactNode;
+  /** Optional browser hover title for a filter option. */
+  getOptionTitle?: (value: string, displayLabel: string) => string;
   /**
    * Current operator of the facet's checkbox filter (arrayOptions AND
    * stringOptions columns; undefined when no filter is applied):
@@ -219,9 +222,12 @@ export interface CategoricalUIFilter extends BaseUIFilter {
 
 export interface NumericUIFilter extends BaseUIFilter {
   type: "numeric";
-  value: [number, number];
+  value: [number, number] | null;
+  conditions: Extract<FilterState[number], { type: "number" }>[];
+  onRemoveCondition: (index: number) => void;
   min: number;
   max: number;
+  step?: number;
   onChange: (value: [number, number]) => void;
   unit?: string;
 }
@@ -253,7 +259,7 @@ export type {
   StringKeyValueFilterEntry,
 } from "../lib/sidebar-filter-actions";
 
-export interface KeyValueUIFilter extends BaseUIFilter {
+interface KeyValueUIFilter extends BaseUIFilter {
   type: "keyValue";
   value: KeyValueFilterEntry[]; // Array of active filter rows
   keyOptions?: string[];
@@ -262,7 +268,7 @@ export interface KeyValueUIFilter extends BaseUIFilter {
   onChange: (filters: KeyValueFilterEntry[]) => void;
 }
 
-export interface NumericKeyValueUIFilter extends BaseUIFilter {
+interface NumericKeyValueUIFilter extends BaseUIFilter {
   type: "numericKeyValue";
   value: NumericKeyValueFilterEntry[]; // Array of active filter rows
   keyOptions?: string[];
@@ -270,7 +276,7 @@ export interface NumericKeyValueUIFilter extends BaseUIFilter {
   onChange: (filters: NumericKeyValueFilterEntry[]) => void;
 }
 
-export interface BooleanKeyValueUIFilter extends BaseUIFilter {
+interface BooleanKeyValueUIFilter extends BaseUIFilter {
   type: "booleanKeyValue";
   value: BooleanKeyValueFilterEntry[]; // Array of active filter rows
   keyOptions?: string[];
@@ -282,6 +288,10 @@ export interface StringKeyValueUIFilter extends BaseUIFilter {
   type: "stringKeyValue";
   value: StringKeyValueFilterEntry[]; // Array of active filter rows
   keyOptions?: string[];
+  /** Offered key → display-only type hint ("number", "object", …). */
+  keyDetails?: Record<string, string>;
+  /** Offered key → its observed values, for the value input's suggestions. */
+  valueOptions?: Record<string, string[]>;
   onChange: (filters: StringKeyValueFilterEntry[]) => void;
 }
 
@@ -295,6 +305,24 @@ export type UIFilter =
   | StringKeyValueUIFilter;
 
 const EMPTY_MAP: Map<string, number> = new Map();
+
+/**
+ * One offered facet option. `type` is the display-only hint client-side
+ * suggestion sources carry (observed metadata keys: "number", "object", …);
+ * server-enumerated options never set it.
+ */
+export type FacetOptionValue = SingleValueOption & { type?: string };
+
+/**
+ * The facet option payload a view hands the sidebar: `filterOptions` per
+ * column, plus whatever client-side suggestion source it opted into. Keyed
+ * lookups (`<column>.<key>`) carry a key's own values — that is how the
+ * metadata facet gets value suggestions (LFE-11030).
+ */
+export type FacetOptions = Record<
+  string,
+  (string | FacetOptionValue)[] | Record<string, string[]> | undefined
+>;
 
 const mergeUniqueStrings = (...lists: (string[] | undefined)[]): string[] =>
   Array.from(
@@ -315,10 +343,7 @@ const SCORE_LEVEL_TAGGED_COLUMNS: Readonly<Record<string, string>> = {
 
 const resolveKeyScoreLevels = (
   column: string,
-  options: Record<
-    string,
-    (string | SingleValueOption)[] | Record<string, string[]> | undefined
-  >,
+  options: FacetOptions,
 ): KeyScoreLevels | undefined => {
   const levelsKey = SCORE_LEVEL_TAGGED_COLUMNS[column];
   const scoreNameLevels = levelsKey ? options[levelsKey] : undefined;
@@ -339,7 +364,7 @@ const resolveKeyScoreLevels = (
 const resolveKnownKeyOptions = (
   facetKeyOptions: string[] | undefined,
   availableKeys:
-    | (string | SingleValueOption)[]
+    | (string | FacetOptionValue)[]
     | Record<string, string[]>
     | undefined,
   activeKeys: string[],
@@ -358,6 +383,43 @@ const resolveKnownKeyOptions = (
     ),
     activeKeys,
   );
+};
+
+/** The display-only type hints an offered key list carries, if any. */
+const resolveKeyDetails = (
+  availableKeys:
+    | (string | FacetOptionValue)[]
+    | Record<string, string[]>
+    | undefined,
+): Record<string, string> | undefined => {
+  if (!Array.isArray(availableKeys)) return undefined;
+  const out: Record<string, string> = {};
+  for (const option of availableKeys) {
+    if (typeof option !== "string" && option.type !== undefined) {
+      out[option.value] = option.type;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+};
+
+/**
+ * Per-key value suggestions for a keyed facet, read from the `<column>.<key>`
+ * entries of the option map (the shape the observed-metadata projection and the
+ * search bar's completion planner both use).
+ */
+const resolveKeyedValueOptions = (
+  column: string,
+  keyOptions: string[] | undefined,
+  options: FacetOptions,
+): Record<string, string[]> | undefined => {
+  if (keyOptions === undefined) return undefined;
+  const out: Record<string, string[]> = {};
+  for (const key of keyOptions) {
+    const values = options[`${column}.${key}`];
+    if (!Array.isArray(values) || values.length === 0) continue;
+    out[key] = values.map((v) => (typeof v === "string" ? v : v.value));
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 };
 
 const mergeAvailableValuesWithActiveFilters = (
@@ -424,6 +486,7 @@ type BaseUseSidebarFilterStateOptions = {
     previousFilters: FilterState;
     nextFilters: FilterState;
     origin: "user" | "saved_view" | "system";
+    action?: "clear";
   }) => void;
   /**
    * Precise per-facet loading set (lazy filter-options): exactly the columns
@@ -472,22 +535,17 @@ const DEFAULT_HOOK_OPTIONS: UseSidebarFilterStateOptions = {
 const toUrlFilterQuery = (encoded: string): string =>
   encoded.length > MAX_URL_FILTER_QUERY_LENGTH ? "" : encoded;
 
-export function useSidebarFilterState(
+/**
+ * State half of the sidebar filters: owns the applied FilterState
+ * (URL/session/memory/peek decode + defaults + managed-env policy) and its
+ * writer. Independent of the filter-OPTIONS payload, so a view can read its
+ * applied filters BEFORE fetching options (events facet counts, LFE-14489).
+ */
+export function useSidebarFilterStateCore(
   config: FilterConfig,
-  options: Record<
-    string,
-    (string | SingleValueOption)[] | Record<string, string[]> | undefined
-  >,
   hookOptions: UseSidebarFilterStateOptions = DEFAULT_HOOK_OPTIONS,
 ) {
-  const {
-    loading,
-    loadingColumns,
-    implicitDefaultConfig,
-    onExplicitFilterStateChange,
-  } = hookOptions;
-  const isV4Surface = hookOptions.isV4 ?? false;
-  const capture = usePostHogClientCapture();
+  const { implicitDefaultConfig, onExplicitFilterStateChange } = hookOptions;
   const stateLocationType = hookOptions.stateLocation;
   const peekContext =
     stateLocationType === "peekContext" ? hookOptions.context : undefined;
@@ -565,6 +623,19 @@ export function useSidebarFilterState(
   );
   const [memoryFilterState, setMemoryFilterState] = useState<FilterState>([]);
 
+  // A column without a facet on this surface is bounded by the page itself
+  // (user-detail traces table). Persisted, deep-linked or saved-view filters on
+  // it are dropped on both boundaries — read and write — so the applied filters
+  // never exceed what the sidebar can show (LFE-14824).
+  const omittedColumns = config.omittedFilterColumns;
+  const stripOmittedColumns = useCallback(
+    (filters: FilterState): FilterState =>
+      !omittedColumns?.length
+        ? filters
+        : filters.filter((filter) => !omittedColumns.includes(filter.column)),
+    [omittedColumns],
+  );
+
   const urlFilterState: FilterState = useMemo(() => {
     if (
       stateLocationType !== "url" &&
@@ -589,10 +660,12 @@ export function useSidebarFilterState(
       return "";
     })();
 
-    return decodeAndNormalizeFilters(
-      rawQuery,
-      config.columnDefinitions,
-      config.migrateFilterState,
+    return stripOmittedColumns(
+      decodeAndNormalizeFilters(
+        rawQuery,
+        config.columnDefinitions,
+        config.migrateFilterState,
+      ),
     );
   }, [
     config.columnDefinitions,
@@ -601,6 +674,7 @@ export function useSidebarFilterState(
     pendingFiltersQuery,
     urlFiltersQuery,
     storedFiltersQuery,
+    stripOmittedColumns,
   ]);
 
   const canonicalFiltersQuery = useMemo(
@@ -615,19 +689,34 @@ export function useSidebarFilterState(
         ? memoryFilterState
         : urlFilterState;
 
+  const managedEnvironmentPolicyConfig = useMemo(
+    () => buildManagedEnvironmentPolicyConfig(implicitDefaultConfig),
+    [implicitDefaultConfig],
+  );
+
   const explicitFilterState = useMemo(() => {
     const defaultFilters = hookOptions.defaultExplicitFilterState ?? [];
-    if (defaultFilters.length === 0) return persistedExplicitFilterState;
+    const merged = (() => {
+      if (defaultFilters.length === 0) return persistedExplicitFilterState;
+      const explicitlyOwnedColumns = new Set(
+        persistedExplicitFilterState.map((filter) => filter.column),
+      );
+      return persistedExplicitFilterState.concat(
+        defaultFilters.filter(
+          (filter) => !explicitlyOwnedColumns.has(filter.column),
+        ),
+      );
+    })();
 
-    const explicitlyOwnedColumns = new Set(
-      persistedExplicitFilterState.map((filter) => filter.column),
-    );
-    return persistedExplicitFilterState.concat(
-      defaultFilters.filter(
-        (filter) => !explicitlyOwnedColumns.has(filter.column),
-      ),
-    );
-  }, [hookOptions.defaultExplicitFilterState, persistedExplicitFilterState]);
+    return canonicalizeExplicitEnvironmentFilters({
+      explicitFilters: merged,
+      config: managedEnvironmentPolicyConfig,
+    });
+  }, [
+    hookOptions.defaultExplicitFilterState,
+    persistedExplicitFilterState,
+    managedEnvironmentPolicyConfig,
+  ]);
 
   // LFE-10164: When arriving via a URL/deep link that already carries applied
   // filters, expand the sidebar sections that have an active filter. Sidebar
@@ -697,36 +786,8 @@ export function useSidebarFilterState(
     });
   }
 
-  const managedEnvironmentPolicyConfig = useMemo(
-    () => buildManagedEnvironmentPolicyConfig(implicitDefaultConfig),
-    [implicitDefaultConfig],
-  );
-
   const managedEnvironmentColumn =
     managedEnvironmentPolicyConfig.managedEnvironmentColumn;
-
-  // Context the pure facet-action functions (lib/sidebar-filter-actions)
-  // read: facet/column metadata, the option lists, and — only while the
-  // managed-environment policy is active — the managed column, which gates
-  // its explicit enable-all-environments override.
-  const actionContext: SidebarFilterActionContext = useMemo(
-    () => ({
-      facets: config.facets,
-      columnDefinitions: config.columnDefinitions,
-      options,
-      managedEnvironmentColumn:
-        managedEnvironmentPolicyConfig.hiddenEnvironments.length > 0
-          ? managedEnvironmentColumn
-          : undefined,
-    }),
-    [
-      config.facets,
-      config.columnDefinitions,
-      options,
-      managedEnvironmentColumn,
-      managedEnvironmentPolicyConfig.hiddenEnvironments,
-    ],
-  );
 
   const effectiveEnvironmentFilterState: FilterState = useMemo(
     () =>
@@ -749,6 +810,23 @@ export function useSidebarFilterState(
     ],
   );
 
+  // Display projection for the search bar: persist the full
+  // `none of [hidden ∪ extras]` exclusion, but show only extras
+  // (`-environment:production`) so implicit hidden envs stay off the chip.
+  const projectFiltersForSearchBar = useCallback(
+    (filters: FilterState) =>
+      toSearchBarEnvironmentFilters({
+        explicitFilters: filters,
+        config: managedEnvironmentPolicyConfig,
+      }),
+    [managedEnvironmentPolicyConfig],
+  );
+
+  const searchBarFilterState: FilterState = useMemo(
+    () => projectFiltersForSearchBar(explicitFilterState),
+    [explicitFilterState, projectFiltersForSearchBar],
+  );
+
   // `options.updateType` controls the history semantics of the URL write:
   // user-initiated filter edits keep the default (push — a Back-able step);
   // programmatic writes (e.g. the session default-view auto-apply) pass
@@ -760,17 +838,21 @@ export function useSidebarFilterState(
       options?: {
         updateType?: UrlUpdateType;
         origin?: "user" | "saved_view" | "system";
+        action?: "clear";
       },
     ) => {
-      const explicitFilters = stripImplicitEnvironmentFilterFromExplicitState({
-        explicitFilters: newFilters,
-        config: managedEnvironmentPolicyConfig,
-      });
+      const explicitFilters = stripOmittedColumns(
+        canonicalizeExplicitEnvironmentFilters({
+          explicitFilters: newFilters,
+          config: managedEnvironmentPolicyConfig,
+        }),
+      );
 
       onExplicitFilterStateChange?.({
         previousFilters: explicitFilterState,
         nextFilters: explicitFilters,
         origin: options?.origin ?? "user",
+        action: options?.action,
       });
 
       if (stateLocationType === "peekContext" && setPeekTableState) {
@@ -817,6 +899,7 @@ export function useSidebarFilterState(
       managedEnvironmentPolicyConfig,
       explicitFilterState,
       onExplicitFilterStateChange,
+      stripOmittedColumns,
     ],
   );
 
@@ -921,6 +1004,82 @@ export function useSidebarFilterState(
     setStoredFiltersQuery,
   ]);
 
+  return {
+    /** Effective applied filters: explicit + defaults + managed-env policy. */
+    filterState,
+    explicitFilterState,
+    searchBarFilterState,
+    projectFiltersForSearchBar,
+    setFilterState,
+    expandedState,
+    onExpandedChange,
+    managedEnvironmentColumn,
+    managedEnvironmentPolicyConfig,
+  };
+}
+
+export type SidebarFilterStateCore = ReturnType<
+  typeof useSidebarFilterStateCore
+>;
+
+export type SidebarFilterPresentationOptions = Pick<
+  BaseUseSidebarFilterStateOptions,
+  "loading" | "loadingColumns" | "isV4"
+>;
+
+/**
+ * Presentation half over a core instance: option-aware facet actions,
+ * analytics, and the UIFilter list.
+ */
+export function useSidebarFilterPresentation(
+  core: SidebarFilterStateCore,
+  config: FilterConfig,
+  options: FacetOptions,
+  presentationOptions: SidebarFilterPresentationOptions = {},
+) {
+  const { loading, loadingColumns } = presentationOptions;
+  const [draftResetKey, setDraftResetKey] = useState(0);
+  const isV4Surface = presentationOptions.isV4 ?? false;
+  const capture = usePostHogClientCapture();
+  const {
+    filterState,
+    explicitFilterState,
+    searchBarFilterState,
+    projectFiltersForSearchBar,
+    setFilterState,
+    expandedState,
+    onExpandedChange,
+    managedEnvironmentColumn,
+    managedEnvironmentPolicyConfig,
+  } = core;
+
+  // Context the pure facet-action functions (lib/sidebar-filter-actions)
+  // read: facet/column metadata, the option lists, and — only while the
+  // managed-environment policy is active — the managed column, which gates
+  // its explicit enable-all-environments override.
+  const actionContext: SidebarFilterActionContext = useMemo(
+    () => ({
+      facets: config.facets,
+      columnDefinitions: config.columnDefinitions,
+      options,
+      managedEnvironmentColumn:
+        managedEnvironmentPolicyConfig.hiddenEnvironments.length > 0
+          ? managedEnvironmentColumn
+          : undefined,
+      hiddenEnvironments:
+        managedEnvironmentPolicyConfig.hiddenEnvironments.length > 0
+          ? managedEnvironmentPolicyConfig.hiddenEnvironments
+          : undefined,
+    }),
+    [
+      config.facets,
+      config.columnDefinitions,
+      options,
+      managedEnvironmentColumn,
+      managedEnvironmentPolicyConfig.hiddenEnvironments,
+    ],
+  );
+
   // When true, the applied-filter capture inside `updateFilter` is suppressed —
   // set by `updateOperator`, which funnels through `updateFilter` but must emit
   // `filters:facet_operator_toggled` instead of a duplicate `filters:applied`.
@@ -980,7 +1139,8 @@ export function useSidebarFilterState(
 
   const clearAll = () => {
     const clearedCount = explicitFilterState.length;
-    setFilterState([]);
+    setDraftResetKey((key) => key + 1);
+    setFilterState([], { action: "clear" });
     if (clearedCount > 0) {
       capture("filters:cleared", {
         surface: "sidebar",
@@ -1219,15 +1379,31 @@ export function useSidebarFilterState(
         };
       }
 
+      if (
+        facet.type === "categorical" &&
+        hasMultipleFilterTargets(filterState, facet.column)
+      ) {
+        return {
+          isDisabled: true,
+          reason:
+            "Edit filters for different targets individually in the filter bar.",
+        };
+      }
+
       return { isDisabled: false };
     };
 
     return config.facets
       .map((facet): UIFilter | null => {
         if (facet.type === "numeric") {
+          const conditions = filterState.filter(
+            (
+              filter,
+            ): filter is Extract<FilterState[number], { type: "number" }> =>
+              filter.column === facet.column && filter.type === "number",
+          );
           const currentRange = computeNumericRange(
-            facet.column,
-            filterState,
+            conditions,
             facet.min,
             facet.max,
           );
@@ -1236,6 +1412,9 @@ export function useSidebarFilterState(
             (f) => f.column === facet.column && f.type === "number",
           );
           const disableState = getFacetDisabledState(facet);
+          const column = config.columnDefinitions.find(
+            (column) => column.id === facet.column,
+          );
           return {
             type: "numeric",
             column: facet.column,
@@ -1244,8 +1423,12 @@ export function useSidebarFilterState(
             help: facet.help,
 
             value: currentRange,
+            conditions,
             min: facet.min,
             max: facet.max,
+            step:
+              facet.step ??
+              (column?.type === "number" ? column.step : undefined),
             unit: facet.unit,
             loading: false,
             expanded: expandedSet.has(facet.column),
@@ -1254,6 +1437,13 @@ export function useSidebarFilterState(
             disabledReason: disableState.reason,
             onChange: (value: [number, number]) =>
               updateNumericFilter(facet.column, value, facet.min, facet.max),
+            onRemoveCondition: (index: number) => {
+              const condition = conditions[index];
+              if (!condition) return;
+              const filterIndex = filterState.indexOf(condition);
+              setFilterState(filterState.filter((_, i) => i !== filterIndex));
+              emitFacetCleared(facet.column, 1);
+            },
             onReset: () =>
               updateNumericFilter(facet.column, null, facet.min, facet.max),
           };
@@ -1295,6 +1485,7 @@ export function useSidebarFilterState(
           const categoryFilters = filterState.filter(
             (f) => f.column === facet.column && f.type === "categoryOptions",
           ) as Array<{
+            target?: string;
             column: string;
             type: "categoryOptions";
             operator: "any of" | "none of";
@@ -1306,6 +1497,7 @@ export function useSidebarFilterState(
           const activeFilters: KeyValueFilterEntry[] = categoryFilters.map(
             (f) => ({
               key: f.key,
+              ...(f.target ? { target: f.target } : {}),
               operator: f.operator,
               value: f.value,
             }),
@@ -1364,6 +1556,7 @@ export function useSidebarFilterState(
           const numericFilters = filterState.filter(
             (f) => f.column === facet.column && f.type === "numberObject",
           ) as Array<{
+            target?: string;
             column: string;
             type: "numberObject";
             operator: "=" | ">" | "<" | ">=" | "<=";
@@ -1375,6 +1568,7 @@ export function useSidebarFilterState(
           const activeFilters: NumericKeyValueFilterEntry[] =
             numericFilters.map((f) => ({
               key: f.key,
+              ...(f.target ? { target: f.target } : {}),
               operator: f.operator,
               value: f.value,
             }));
@@ -1444,6 +1638,7 @@ export function useSidebarFilterState(
           const booleanFilters = filterState.filter(
             (f) => f.column === facet.column && f.type === "booleanObject",
           ) as Array<{
+            target?: string;
             column: string;
             type: "booleanObject";
             operator: "=" | "<>";
@@ -1454,6 +1649,7 @@ export function useSidebarFilterState(
           const activeFilters: BooleanKeyValueFilterEntry[] =
             booleanFilters.map((f) => ({
               key: f.key,
+              ...(f.target ? { target: f.target } : {}),
               operator: f.operator,
               value: f.value,
             }));
@@ -1497,9 +1693,15 @@ export function useSidebarFilterState(
           const stringFilters = filterState.filter(
             (f) => f.column === facet.column && f.type === "stringObject",
           ) as Array<{
+            target?: string;
             column: string;
             type: "stringObject";
-            operator: "=" | "contains" | "does not contain";
+            operator:
+              | "="
+              | "contains"
+              | "does not contain"
+              | "is set"
+              | "is not set";
             key: string;
             value: string;
           }>;
@@ -1508,6 +1710,7 @@ export function useSidebarFilterState(
           const activeFilters: StringKeyValueFilterEntry[] = stringFilters.map(
             (f) => ({
               key: f.key,
+              ...(f.target ? { target: f.target } : {}),
               operator: f.operator,
               value: f.value,
             }),
@@ -1533,6 +1736,12 @@ export function useSidebarFilterState(
 
             value: activeFilters,
             keyOptions,
+            keyDetails: resolveKeyDetails(availableKeys),
+            valueOptions: resolveKeyedValueOptions(
+              facet.column,
+              keyOptions,
+              options,
+            ),
             loading: shouldShowLoading(facet.column),
             expanded: expandedSet.has(facet.column),
             isActive,
@@ -1553,19 +1762,19 @@ export function useSidebarFilterState(
           const falseLabel = facet.falseLabel ?? "False";
           const invert = facet.invertValue ?? false;
           const availableOptions = [trueLabel, falseLabel];
-          const filterEntry = filterByColumn.get(facet.column);
-
-          let selectedOptions = availableOptions;
-          if (filterEntry) {
-            const boolValue = filterEntry.value as boolean;
-            if (invert) {
-              // Inverted: filter value=true means falseLabel selected, value=false means trueLabel selected
-              selectedOptions = boolValue === true ? [falseLabel] : [trueLabel];
-            } else {
-              selectedOptions = boolValue === true ? [trueLabel] : [falseLabel];
-            }
-          }
-          const isActive = selectedOptions.length === 1;
+          const booleanFilters = filterState.filter(
+            (filter) =>
+              filter.column === facet.column && filter.type === "boolean",
+          );
+          const selectedOptions = availableOptions.filter((label) => {
+            const value = label === trueLabel ? !invert : invert;
+            return booleanFilters.every((filter) =>
+              filter.operator === "="
+                ? filter.value === value
+                : filter.value !== value,
+            );
+          });
+          const isActive = booleanFilters.length > 0;
           const disableState = getFacetDisabledState(facet);
 
           // Build counts from options
@@ -1605,31 +1814,29 @@ export function useSidebarFilterState(
             isActive,
             isDisabled: disableState.isDisabled,
             disabledReason: disableState.reason,
-            onChange: (values: string[]) => {
-              if (values.length === 0 || values.length === 2) {
-                updateFilter(facet.column, []);
-                return;
-              }
-              if (values.includes(trueLabel) && !values.includes(falseLabel)) {
-                updateFilter(facet.column, [trueLabel]);
-              } else if (
-                values.includes(falseLabel) &&
-                !values.includes(trueLabel)
-              ) {
-                updateFilter(facet.column, [falseLabel]);
-              }
-            },
+            onChange: (values: string[]) => updateFilter(facet.column, values),
             onOnlyChange: (value: string) => {
               if (
                 selectedOptions.length === 1 &&
                 selectedOptions.includes(value)
               ) {
-                updateFilter(facet.column, []);
+                updateFilter(facet.column, availableOptions);
               } else {
                 updateFilter(facet.column, [value]);
               }
             },
-            onReset: () => updateFilter(facet.column, []),
+            onReset: () => {
+              const next = filterState.filter(
+                (filter) => filter.column !== facet.column,
+              );
+              setFilterState(next);
+              if (next.length < filterState.length) {
+                emitFacetCleared(
+                  facet.column,
+                  filterState.length - next.length,
+                );
+              }
+            },
           };
         }
 
@@ -1667,10 +1874,13 @@ export function useSidebarFilterState(
             (f.type === "stringOptions" || f.type === "arrayOptions"),
         );
 
-        const selectedValues = computeSelectedValues(
-          availableValues,
-          checkboxFilter,
+        const hasEmptyPositiveSelection = hasEmptyCheckboxSelection(
+          filterState,
+          facet.column,
         );
+        const selectedValues = hasEmptyPositiveSelection
+          ? []
+          : computeSelectedValues(availableValues, checkboxFilter);
 
         // Determine current operator for ANY/ALL toggle
         // When a user selects items in an arrayOptions filter, we expose a toggle
@@ -1726,11 +1936,13 @@ export function useSidebarFilterState(
         // A user-authored environment filter lives in EXPLICIT state; the
         // implicit hidden-env default (`none of [hidden]`) is added to EFFECTIVE
         // state only and stripped from explicit state by the managed-environment
-        // policy. So "explicit env filter present" is exactly "the user committed
-        // to an environment selection" — including `environment:default` (any-of
-        // the default set), which now persists. Keying the facet's active state
-        // off this keeps it in sync with the search bar, which renders any
-        // explicit env filter as a chip.
+        // policy. Extra exclusions on top of that default persist as
+        // `none of [hidden ∪ extras]`; the search bar display projection shows
+        // only extras. So "explicit env filter present" is exactly
+        // "the user committed to an environment selection" — including
+        // `environment:default` (any-of the default set), which now persists.
+        // Keying the facet's active state off this keeps it in sync with the
+        // search bar, which renders any explicit env filter as a chip.
         const hasExplicitManagedEnvironmentFilter =
           isManagedEnvironmentFacet &&
           explicitFilterState.some(
@@ -1749,6 +1961,7 @@ export function useSidebarFilterState(
         //   its "Clear" affordance.
         const isActive =
           hasTextFilters ||
+          hasEmptyPositiveSelection ||
           (isManagedEnvironmentFacet
             ? hasExplicitManagedEnvironmentFilter
             : (currentOperator === "all of" &&
@@ -1777,6 +1990,10 @@ export function useSidebarFilterState(
           disabledReason: disableState.reason,
           renderIcon:
             facet.type === "categorical" ? facet.renderIcon : undefined,
+          renderOptionSuffix:
+            facet.type === "categorical" ? facet.renderOptionSuffix : undefined,
+          getOptionTitle:
+            facet.type === "categorical" ? facet.getOptionTitle : undefined,
           onChange: (values: string[]) => updateFilter(facet.column, values),
           onOnlyChange: (value: string) => {
             if (selectedValues.length === 1 && selectedValues.includes(value)) {
@@ -1851,11 +2068,14 @@ export function useSidebarFilterState(
     filterState,
     effectiveFilterState: filterState,
     explicitFilterState,
+    searchBarFilterState,
+    projectFiltersForSearchBar,
     setFilterState,
     updateFilter,
     updateFilterOnly,
     updateOperator,
     clearAll,
+    draftResetKey,
     isFiltered: explicitFilterState.length > 0,
     filters,
     expanded: expandedState,
@@ -1864,4 +2084,17 @@ export function useSidebarFilterState(
     // v3-vs-v4 dimension as the hook's own events.
     isV4: isV4Surface,
   };
+}
+
+/**
+ * Core + presentation in one call. Views that need the applied filter state
+ * before fetching options compose the two hooks directly (see EventsTable).
+ */
+export function useSidebarFilterState(
+  config: FilterConfig,
+  options: FacetOptions,
+  hookOptions: UseSidebarFilterStateOptions = DEFAULT_HOOK_OPTIONS,
+) {
+  const core = useSidebarFilterStateCore(config, hookOptions);
+  return useSidebarFilterPresentation(core, config, options, hookOptions);
 }

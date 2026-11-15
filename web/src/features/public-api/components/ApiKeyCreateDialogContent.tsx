@@ -1,7 +1,18 @@
-import React from "react";
+/* eslint-disable @typescript-eslint/no-deprecated -- Legacy UI usage retained during migration to design-system components. */
+import React, { useState } from "react";
+import { ArrowUpRight } from "@langfuse/icons";
+import { useSession } from "next-auth/react";
+
+import { type SystemRole } from "@langfuse/shared/src/db";
+import {
+  apiKeyRolesForScope,
+  systemRoleAccessRights,
+} from "@langfuse/shared/rbac";
+
 import { Button } from "@/src/components/ui/button";
 import {
   DialogBody,
+  DialogClose,
   DialogContent,
   DialogFooter,
   DialogHeader,
@@ -9,17 +20,42 @@ import {
 } from "@/src/components/ui/dialog";
 import { Input } from "@/src/components/ui/input";
 import { Label } from "@/src/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectTrigger,
+} from "@/src/components/ui/select";
+import { withoutGatewayRole } from "@/src/features/ai-gateway/fns/separateGatewayApiKeys";
+import { ApiKeyExpirationInput } from "@/src/features/apiKey/components/ApiKeyExpirationInput/ApiKeyExpirationInput";
+import type { ApiKeyExpirationPreset } from "@/src/features/apiKey/constants/apiKeyExpirationOptions";
+import { resolveApiKeyExpiration } from "@/src/features/apiKey/fns/resolveApiKeyExpiration";
 import { ApiKeyDetailContent } from "@/src/features/public-api/components/ApiKeyDetailContent";
+import { rolePermissionCountLabel } from "@/src/features/rbac/components/RolePermissionList";
+import { RolePermissionPopup } from "@/src/features/rbac/components/RolePermissionPopup";
+import { RoleSelectItem } from "@/src/features/rbac/components/RoleSelectItem";
+import { roleIcons } from "@/src/features/rbac/components/roleIcons";
 
 type ApiKeyScope = "project" | "organization";
+
+const DEFAULT_ROLE: SystemRole = "ADMIN";
+
+/** apiKeyRoleNames renames user roles to be more api-key friendly. */
+const apiKeyRoleNames: Record<string, string> = {
+  Admin: "Full access",
+};
+
+/** ApiKeyCreateValues is the resolved create-form payload the button forwards to the create mutation. */
+export type ApiKeyCreateValues = {
+  name: string;
+  role?: SystemRole;
+  expiresAt: Date | null;
+};
 
 export type ApiKeyCreateDialogContentProps =
   | {
       scope: ApiKeyScope;
       type: "form";
-      note: string;
-      onNoteChange: (value: string) => void;
-      onSubmit: () => void;
+      onSubmit: (values: ApiKeyCreateValues) => void;
       isPending?: boolean;
     }
   | (Omit<
@@ -38,7 +74,7 @@ export function ApiKeyCreateDialogContent(
     const { secretKey, publicKey, baseUrl } = props;
 
     return (
-      <DialogContent closeOnInteractionOutside>
+      <DialogContent>
         <DialogHeader>
           <DialogTitle>API Keys</DialogTitle>
         </DialogHeader>
@@ -51,41 +87,160 @@ export function ApiKeyCreateDialogContent(
             showMcpSection={true}
           />
         </DialogBody>
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button>Done</Button>
+          </DialogClose>
+        </DialogFooter>
       </DialogContent>
     );
   }
 
-  const { note, onNoteChange, onSubmit, isPending } = props;
+  return <ApiKeyCreateForm {...props} />;
+}
+
+function ApiKeyCreateForm({
+  scope,
+  onSubmit,
+  isPending,
+}: Extract<ApiKeyCreateDialogContentProps, { type: "form" }>) {
+  const roles = withoutGatewayRole(apiKeyRolesForScope(scope));
+  const { data: session } = useSession();
+  const roleSelectionEnabled =
+    (scope === "project"
+      ? session?.environment?.apiKeyProjectRoleSelectionEnabled
+      : session?.environment?.apiKeyOrgRoleSelectionEnabled) ?? false;
+
+  const [name, setName] = useState("");
+  const [role, setRole] = useState<SystemRole>(DEFAULT_ROLE);
+  const [expiryPreset, setExpiryPreset] =
+    useState<ApiKeyExpirationPreset>("never");
+  const [customExpiry, setCustomExpiry] = useState("");
+  const [roleSelectOpen, setRoleSelectOpen] = useState(false);
+  const [permissionsOpen, setPermissionsOpen] = useState(false);
+  const [permissionsRole, setPermissionsRole] = useState<SystemRole | null>(
+    null,
+  );
+
+  const expiresAt = resolveApiKeyExpiration(expiryPreset, customExpiry);
+  const submitDisabled = name.trim() === "" || expiresAt === undefined;
+
+  const openPermissions = (target: SystemRole) => {
+    setRoleSelectOpen(false);
+    setPermissionsRole(target);
+    setPermissionsOpen(true);
+  };
+
+  const submit = () => {
+    if (submitDisabled) return;
+    onSubmit({
+      name: name.trim(),
+      ...(roleSelectionEnabled ? { role } : {}),
+      expiresAt,
+    });
+  };
+
+  const selectedRoleDef = systemRoleAccessRights[role];
+  const SelectedRoleIcon = roleIcons[role];
 
   return (
     <DialogContent closeOnInteractionOutside>
       <DialogHeader>
-        <DialogTitle>Create API Keys</DialogTitle>
+        <DialogTitle>Create API key</DialogTitle>
       </DialogHeader>
       <DialogBody>
-        <div className="space-y-4">
-          <div>
-            <Label htmlFor="note">Note (optional)</Label>
+        <div className="flex flex-col gap-5">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="apiKeyName">Name</Label>
             <Input
-              id="note"
-              placeholder="Production key"
-              value={note}
-              onChange={(e) => onNoteChange(e.target.value)}
+              id="apiKeyName"
+              placeholder="e.g. Production server"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  onSubmit();
-                }
+                if (e.key === "Enter") submit();
               }}
-              className="mt-1.5"
             />
           </div>
+
+          <ApiKeyExpirationInput
+            id="apiKeyExpiry"
+            expiryPreset={expiryPreset}
+            customExpiry={customExpiry}
+            onExpiryPresetChange={setExpiryPreset}
+            onCustomExpiryChange={setCustomExpiry}
+          />
+
+          {roleSelectionEnabled && (
+            <div className="flex flex-col gap-1.5">
+              <Label>Permissions</Label>
+              <Select
+                open={roleSelectOpen}
+                onOpenChange={setRoleSelectOpen}
+                value={role}
+                onValueChange={(value) => setRole(value as SystemRole)}
+              >
+                <SelectTrigger className="h-auto" disableValueLineClamp>
+                  <div className="flex items-start gap-2 text-left">
+                    <SelectedRoleIcon size="base" __rawClassName="mt-0.5" />
+                    <div className="flex flex-col">
+                      <span className="font-bold">
+                        {transformApiKeyRoleName(selectedRoleDef.name)}
+                      </span>
+                      <span className="text-muted-foreground text-xs">
+                        {selectedRoleDef.description}
+                      </span>
+                    </div>
+                  </div>
+                </SelectTrigger>
+                <SelectContent>
+                  {roles.map((r) => (
+                    <RoleSelectItem
+                      key={r}
+                      role={r}
+                      transformName={transformApiKeyRoleName}
+                      onViewPermissions={openPermissions}
+                    />
+                  ))}
+                </SelectContent>
+              </Select>
+              <button
+                type="button"
+                onClick={() => {
+                  setPermissionsRole(role);
+                  setPermissionsOpen(true);
+                }}
+                className="text-muted-foreground hover:text-foreground ml-1 w-fit text-xs"
+              >
+                View{" "}
+                <span className="inline-flex items-center gap-0.5 underline">
+                  {rolePermissionCountLabel(role)}
+                  <ArrowUpRight size="sm" />
+                </span>
+              </button>
+            </div>
+          )}
         </div>
+
+        {roleSelectionEnabled && (
+          <RolePermissionPopup
+            open={permissionsOpen}
+            onOpenChange={setPermissionsOpen}
+            role={permissionsRole}
+            transformName={transformApiKeyRoleName}
+          />
+        )}
       </DialogBody>
       <DialogFooter>
-        <Button onClick={onSubmit} loading={isPending}>
-          Create API keys
+        <Button onClick={submit} loading={isPending} disabled={submitDisabled}>
+          Create API key
         </Button>
       </DialogFooter>
     </DialogContent>
   );
+}
+
+/** transformApiKeyRoleName maps a role name to its api key display name. */
+function transformApiKeyRoleName(name: string): string {
+  return apiKeyRoleNames[name] ?? name;
 }

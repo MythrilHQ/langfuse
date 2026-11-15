@@ -13,6 +13,7 @@
  * SESSION_OBSERVATIONS_PER_TRACE_LIMIT + 1 real observations come back, and
  * the extra (+1) row is the client's "has more" sentinel.
  */
+import { testFeatureFlags } from "@/src/__tests__/fixtures/feature-flags";
 import type { Session } from "next-auth";
 import { prisma } from "@langfuse/shared/src/db";
 import { appRouter } from "@/src/server/api/root";
@@ -20,6 +21,7 @@ import { createInnerTRPCContext } from "@/src/server/api/trpc";
 import { createEvent, createEventsCh } from "@langfuse/shared/src/server";
 import waitForExpect from "wait-for-expect";
 import { randomUUID } from "crypto";
+import superjson from "superjson";
 
 // The events_full table is created only by the ClickHouse dev-tables setup,
 // which runs in the default deploy-mode where .env.dev.example enables the v4
@@ -45,6 +47,8 @@ const PER_TRACE_LIMIT = 50;
 // PER_TRACE_LIMIT real rows means the trace has more than the card shows.
 const hasMore = (observations: { id: string }[], traceId: string) =>
   observations.filter((o) => o.id !== `t-${traceId}`).length > PER_TRACE_LIMIT;
+const parseMetadata = (metadata: string | null) =>
+  JSON.parse(metadata ?? "{}") as Record<string, unknown>;
 
 maybe("sessions observations bounded I/O (events)", () => {
   const projectId = "7a88fb47-b4e2-43b8-a06c-a5ce950dc53a";
@@ -79,15 +83,7 @@ maybe("sessions observations bounded I/O (events)", () => {
           ],
         },
       ],
-      featureFlags: {
-        excludeClickhouseRead: false,
-        templateFlag: true,
-        searchBar: false,
-        v4BetaToggleVisible: false,
-        observationEvals: false,
-        experimentsV4Enabled: false,
-      },
-      admin: true,
+      featureFlags: testFeatureFlags(),
     },
     environment: {} as any,
   };
@@ -194,9 +190,44 @@ maybe("sessions observations bounded I/O (events)", () => {
 
     const observation = observations[0];
     expect(observation.metadataTruncated).toBe(true);
-    const metadata = observation.metadata as Record<string, unknown>;
+    const metadata = parseMetadata(observation.metadata);
     expect(String(metadata.big).length).toBe(PREVIEW_LIMIT);
     expect(metadata.small).toBe("tiny");
+  });
+
+  it("serializes metadata containing a constructor key", async () => {
+    const { sessionId, traceId, baseTime } = await seedObservations([
+      {
+        input: "x".repeat(INLINE_LIMIT + 1),
+        metadataNames: ["constructor"],
+        metadataValues: ["test"],
+      },
+    ]);
+
+    const observations = await caller.sessions.observationsForTraceFromEvents({
+      projectId,
+      sessionId,
+      traceId,
+      filter: [],
+    });
+
+    // createCaller bypasses the tRPC transformer, so exercise the production
+    // response serialization boundary explicitly.
+    expect(() => superjson.serialize(observations)).not.toThrow();
+    expect(observations[0]?.metadata).toBe(
+      JSON.stringify({ constructor: "test" }),
+    );
+
+    const full = await caller.sessions.observationFullIOFromEvents({
+      projectId,
+      sessionId,
+      traceId,
+      observationId: `${traceId}-o0`,
+      startTime: new Date(baseTime),
+    });
+
+    expect(() => superjson.serialize(full)).not.toThrow();
+    expect(full.metadata).toBe(JSON.stringify({ constructor: "test" }));
   });
 
   it("caps observations per card and signals more exist via the +1 sentinel", async () => {
@@ -375,9 +406,7 @@ maybe("sessions observations bounded I/O (events)", () => {
     });
 
     const observation = observations[0];
-    expect((observation.metadata as Record<string, unknown>).k).toBe(
-      "small-winner",
-    );
+    expect(parseMetadata(observation.metadata).k).toBe("small-winner");
     expect(observation.metadataTruncated).toBe(false);
   });
 
@@ -404,13 +433,11 @@ maybe("sessions observations bounded I/O (events)", () => {
 
     const first = observations[0];
     expect(first.metadataTruncated).toBe(false);
-    expect(
-      String((first.metadata as Record<string, unknown>).payload).length,
-    ).toBe(290_000);
+    expect(String(parseMetadata(first.metadata).payload).length).toBe(290_000);
 
     const last = observations[observations.length - 1];
     expect(last.metadataTruncated).toBe(true);
-    expect(last.metadata).toEqual({});
+    expect(last.metadata).toBe("{}");
   });
 
   it("serves full I/O for one observation via observationFullIOFromEvents, scoped to the session", async () => {

@@ -6,12 +6,20 @@ vi.mock("@langfuse/shared/src/server", async () => ({
     error: vi.fn(),
     debug: vi.fn(),
   },
+  traceException: vi.fn(),
 }));
 
 import type { Session } from "next-auth";
 import { TRPCError } from "@trpc/server";
 import * as z from "zod";
-import { ClickHouseResourceError, logger } from "@langfuse/shared/src/server";
+import {
+  ClickHouseResourceError,
+  logger,
+  traceException,
+} from "@langfuse/shared/src/server";
+import { Prisma } from "@langfuse/shared/src/db";
+import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
+import { reportTRPCError } from "@/src/server/utils/trpc-utils";
 import {
   createInnerTRPCContext,
   createTRPCRouter,
@@ -23,7 +31,14 @@ describe("tRPC error formatting", () => {
     vi.clearAllMocks();
   });
 
-  it("ClickHouseResourceError", async () => {
+  it.each([
+    { errorType: "MEMORY_LIMIT", message: "Memory limit exceeded" },
+    {
+      errorType: "RESULT_SIZE",
+      message:
+        "Limit for result exceeded, max bytes: 10.00 MiB. (TOO_MANY_ROWS_OR_BYTES) SELECT private_column FROM private_table",
+    },
+  ])("ClickHouseResourceError $errorType", async ({ errorType, message }) => {
     const session = {
       user: {
         id: "user-1",
@@ -34,10 +49,7 @@ describe("tRPC error formatting", () => {
       clickhouse: protectedProcedureWithoutTracing
         .input(z.object({}))
         .query(() => {
-          throw new ClickHouseResourceError(
-            "MEMORY_LIMIT",
-            new Error("Memory limit exceeded"),
-          );
+          throw ClickHouseResourceError.wrapIfResourceError(new Error(message));
         }),
     });
 
@@ -60,6 +72,12 @@ describe("tRPC error formatting", () => {
     }
 
     expect(error).toBeInstanceOf(TRPCError);
+    expect(error!.code).toBe("UNPROCESSABLE_CONTENT");
+    expect(error!.message).not.toContain(message);
+    if (errorType === "RESULT_SIZE") {
+      expect(error!.message).toMatch(/result is too large/i);
+      expect(error!.message).toMatch(/date range.*filters/i);
+    }
 
     const formatted = formatter({
       shape: {
@@ -80,8 +98,8 @@ describe("tRPC error formatting", () => {
     expect(logger.warn).toHaveBeenCalledWith(
       "ClickHouse resource limit exceeded",
       expect.objectContaining({
-        errorType: "MEMORY_LIMIT",
-        message: "Memory limit exceeded",
+        errorType,
+        message,
       }),
     );
     expect(logger.error).not.toHaveBeenCalled();
@@ -129,5 +147,65 @@ describe("tRPC error formatting", () => {
     });
 
     expect(formattedWithStack.data["stack"]).toBe("dev stack");
+  });
+
+  describe("over HTTP", () => {
+    const fetchFailing = (thrown: unknown) => {
+      const router = createTRPCRouter({
+        failing: protectedProcedureWithoutTracing.query(() => {
+          throw thrown;
+        }),
+      });
+      return fetchRequestHandler({
+        endpoint: "/api/trpc",
+        req: new Request("http://localhost/api/trpc/failing"),
+        router,
+        createContext: () =>
+          createInnerTRPCContext({
+            session: { user: { id: "user-1" } } as Session,
+            headers: {},
+          }),
+        onError: reportTRPCError,
+      });
+    };
+
+    it.each([
+      [
+        "Prisma",
+        new Prisma.PrismaClientKnownRequestError(
+          "Unique constraint failed on the fields: (`id`)",
+          { code: "P2002", clientVersion: "test" },
+        ),
+      ],
+      [
+        "uncaused TRPCError",
+        new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: "connection refused",
+        }),
+      ],
+    ])(
+      "traces the %s cause on the span but returns a generic 5xx",
+      async (_, original) => {
+        const res = await fetchFailing(original);
+        const body = await res.text();
+
+        expect(res.status).toBe(500);
+        expect(body).toContain("Internal error. ");
+        expect(body).not.toContain(original.message);
+        expect(traceException).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(traceException).mock.calls[0]?.[0]).toBe(original);
+      },
+    );
+
+    it("keeps the message of a 4xx error and does not trace it", async () => {
+      const res = await fetchFailing(
+        new TRPCError({ code: "BAD_REQUEST", message: "Invalid filter" }),
+      );
+
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain("Invalid filter");
+      expect(traceException).not.toHaveBeenCalled();
+    });
   });
 });

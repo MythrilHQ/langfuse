@@ -125,7 +125,15 @@ def handler(event, context):
     except Exception as error:
         return runner_error("USER_CODE_ERROR", format_error(error))
 
-    return normalize_result(result)
+    # Cycles raise RecursionError, or ValueError from json.dumps.
+    try:
+        return normalize_result(result)
+    except (RecursionError, ValueError) as error:
+        return runner_error(
+            "INVALID_RESULT",
+            "Evaluator returned a result that could not be serialized: "
+            f"{format_error(error)}",
+        )
 
 
 def normalize_result(result):
@@ -138,6 +146,21 @@ def normalize_result(result):
             "INVALID_RESULT",
             "Evaluator must return an object shaped like { scores: [...] }",
         )
+
+    for score in normalized["scores"]:
+        if not isinstance(score, dict):
+            continue
+
+        # Plain dictionaries bypass the Score dataclass field translation.
+        # Retry known Python aliases at the score boundary without rewriting
+        # arbitrary user metadata. Explicit wire-format keys take precedence.
+        for alias, key in _DATACLASS_FIELD_NAME_OVERRIDES.items():
+            if alias not in score:
+                continue
+
+            alias_value = score.pop(alias)
+            if alias_value is not None and key not in score:
+                score[key] = alias_value
 
     return normalized
 

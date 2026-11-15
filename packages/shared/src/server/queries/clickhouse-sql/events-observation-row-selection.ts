@@ -1,15 +1,37 @@
 import { eventsTableCols } from "../../../eventsTable";
-import { InvalidRequestError } from "../../../errors";
-import type { TracingSearchType } from "../../../interfaces/search";
-import { findUiColumnMapping } from "../../../tableDefinitions";
+import { InvalidRequestError } from "../../../errors/InvalidRequestError";
+import type { OrderByState } from "../../../interfaces/orderBy";
+import {
+  hasValidTracingSearchTypes,
+  TRACING_SEARCH_TYPE_REQUIRED_MESSAGE,
+  type TracingSearchType,
+} from "../../../interfaces/search";
+import { fromFilterState } from "../../../query-ast/filterStateCodec";
+import type {
+  PredicateAnd,
+  PredicateCondition,
+} from "../../../query-ast/predicate";
+import {
+  eventsPredicateSource,
+  resolvePredicateSourceField,
+} from "../../../query-ast/sources";
+import { findUiColumnMapping } from "../../../tableDefinitions/types";
 import type { FilterCondition } from "../../../types";
-import { eventsTableUiColumnDefinitions } from "../../tableMappings/mapEventsTable";
+import { convertDateToClickhouseDateTime } from "../../clickhouse/client";
+import {
+  compileEventsPredicate,
+  compileEventsSearch,
+  type CompiledEventsCondition,
+} from "../../repositories/events-predicate";
+import {
+  eventsTableUiColumnDefinitions,
+  TRACE_SCORES_JOIN_ALIAS,
+} from "../../tableMappings/mapEventsTable";
 import {
   BooleanObjectFilter,
   CategoryOptionsFilter,
   type Filter,
   FilterList,
-  filtersRequireEventsFull,
   NumberObjectFilter,
 } from "./clickhouse-filter";
 import { EventsQueryBuilder } from "./event-query-builder";
@@ -17,11 +39,14 @@ import {
   createFilterFromFilterState,
   resolveLegacyScoreFilterColumn,
 } from "./factory";
-import { extractTimeFilter } from "./filter-utils";
 import {
   eventsScoresAggregation,
   eventsTracesScoresAggregationFromObservationStart,
 } from "./query-fragments";
+import {
+  planScoreFilterPushdown,
+  resolveScoreDataRequirement,
+} from "./score-filter-pushdown";
 import { clickhouseSearchCondition } from "./search";
 
 const EVENT_SEARCH_COLUMNS = [
@@ -61,52 +86,19 @@ export type EventsObservationRowSelectionInput = {
   filter: FilterCondition[] | null;
   searchQuery?: string;
   searchType?: TracingSearchType[];
+  /** Used to add the required score CTE and keep its source complete. */
+  orderBy?: OrderByState;
 };
 
-type ObservationScoreDependency = {
-  cte: ReturnType<typeof eventsScoresAggregation>;
-  joinTable: string;
-  joinCondition: string;
-  selectExpressions?: string[];
-  /**
-   * Blob export: also join the trace-score CTE (with tuple encoding) so the
-   * `ts.*` select expressions resolve and trace-level scores land in the
-   * export like they do in the UI's unified Scores column (LFE-10596).
-   */
-  includeTraceScores?: boolean;
-};
+type ScoreProjection = "none" | "blob-export";
 
-type ObservationScoreDependencyFactory = (input: {
-  projectId: string;
-  startTimeFrom: string | null;
-}) => ObservationScoreDependency;
-
-const buildObservationScoreFilterDependency: ObservationScoreDependencyFactory =
-  ({ projectId, startTimeFrom }) => ({
-    cte: eventsScoresAggregation({ projectId, startTimeFrom }),
-    joinTable: "scores_agg AS s",
-    joinCondition: "ON s.observation_id = e.span_id",
-  });
-
-const buildBlobExportObservationScoreDependency: ObservationScoreDependencyFactory =
-  ({ projectId, startTimeFrom }) => ({
-    cte: eventsScoresAggregation({
-      projectId,
-      startTimeFrom,
-      includeTupleEncoding: true,
-    }),
-    joinTable: "scores_agg s",
-    joinCondition:
-      "ON s.trace_id = e.trace_id AND s.observation_id = e.span_id",
-    selectExpressions: [
-      "s.scores_avg as scores_avg",
-      "s.score_categories as score_categories",
-      "s.score_categories_tuples as score_categories_tuples",
-      "ts.scores_avg as trace_scores_avg",
-      "ts.score_categories_tuples as trace_score_categories_tuples",
-    ],
-    includeTraceScores: true,
-  });
+const BLOB_EXPORT_SCORE_SELECTS = [
+  "s.scores_avg as scores_avg",
+  "s.score_categories as score_categories",
+  "s.score_categories_tuples as score_categories_tuples",
+  `${TRACE_SCORES_JOIN_ALIAS}.scores_avg as trace_scores_avg`,
+  `${TRACE_SCORES_JOIN_ALIAS}.score_categories_tuples as trace_score_categories_tuples`,
+];
 
 // LFE-10596: in v4 the events table splits scores into observation-scoped
 // columns (`s.scores_avg` / `s.score_categories` / `s.score_booleans`, joined
@@ -120,9 +112,9 @@ const buildBlobExportObservationScoreDependency: ObservationScoreDependencyFacto
 // `trace_score_categories` / `trace_score_booleans` (the search bar's
 // `traceScores.`) stay trace-only.
 const OBSERVATION_SCORE_FIELDS = {
-  "s.scores_avg": "ts.scores_avg",
-  "s.score_categories": "ts.score_categories",
-  "s.score_booleans": "ts.score_booleans",
+  "s.scores_avg": `${TRACE_SCORES_JOIN_ALIAS}.scores_avg`,
+  "s.score_categories": `${TRACE_SCORES_JOIN_ALIAS}.score_categories`,
+  "s.score_booleans": `${TRACE_SCORES_JOIN_ALIAS}.score_booleans`,
 } as const;
 
 /** A Filter whose predicate combines its children with a single junction. */
@@ -216,7 +208,9 @@ const classifyFilter = (filter: FilterCondition): EventFilterGroup => {
     return "comments";
   }
 
-  if (columnDefinition?.clickhouseSelect.startsWith("ts.")) {
+  if (
+    columnDefinition?.clickhouseSelect.startsWith(`${TRACE_SCORES_JOIN_ALIAS}.`)
+  ) {
     return "traceScores";
   }
 
@@ -244,19 +238,210 @@ export const groupEventsObservationFilters = (
   return filterGroups;
 };
 
+/**
+ * The row conditions of the events (non-score) filters and the free-text
+ * search, each compiled through the events predicate (`undefined` without
+ * one), and what they imply for the host query.
+ */
+export type EventsRowConditions = {
+  events?: CompiledEventsCondition;
+  search?: CompiledEventsCondition;
+  requiresEventsFull: boolean;
+  /**
+   * The latest (tightest) top-level `startTime >=` / `>` filter value, which
+   * bounds the score CTEs.
+   */
+  startTimeFrom: string | null;
+};
+
+/** The conditions of `predicate`, a conjunction `fromFilterState` built. */
+const predicateConditions = (predicate: PredicateAnd): PredicateCondition[] =>
+  predicate.children.filter(
+    (child): child is PredicateCondition => child.kind === "condition",
+  );
+
+/**
+ * Throws `InvalidRequestError` for a `numberObject` filter on metadata: the
+ * metadata filter column is typed `stringObject`, and numeric metadata
+ * conditions are not offered to users yet.
+ */
+const rejectNumericMetadata = (leaves: FilterCondition[]): void => {
+  const numeric = leaves.find(
+    (leaf) =>
+      leaf.type === "numberObject" &&
+      resolvePredicateSourceField(eventsPredicateSource, leaf.column)?.id ===
+        "metadata",
+  );
+  if (numeric) {
+    throw new InvalidRequestError(
+      `Invalid filter type 'numberObject' for column '${numeric.column}'. Expected filter type 'stringObject'.`,
+    );
+  }
+};
+
+/**
+ * The latest `startTime >=` / `>` bound among the top-level conditions, as
+ * ClickHouse text. Every row matches all of them, so the latest one is the
+ * tightest sound lower bound for the score CTEs.
+ */
+const startTimeFromOf = (conditions: PredicateCondition[]): string | null => {
+  const bounds = conditions.flatMap((condition) =>
+    condition.type === "datetime" &&
+    (condition.op === ">=" || condition.op === ">") &&
+    resolvePredicateSourceField(eventsPredicateSource, condition.field.id)
+      ?.id === "startTime"
+      ? [new Date(condition.value).getTime()]
+      : [],
+  );
+  return bounds.length > 0
+    ? convertDateToClickhouseDateTime(new Date(Math.max(...bounds)))
+    : null;
+};
+
+/** `condition` as a WHERE clause of the raw-SQL builders; none without one. */
+export const rowConditionClause = (
+  condition: CompiledEventsCondition | undefined,
+) => ({
+  query: condition?.sql ?? "",
+  params: condition?.params,
+});
+
+/**
+ * `filter` without its `positionInTrace` leaves. They select events by their
+ * place in the trace, not by a row condition, so callers of the row-selection
+ * planner strip them first and handle them on their own, or drop them.
+ */
+export const withoutPositionInTrace = (
+  filter: FilterCondition[] | null,
+): FilterCondition[] =>
+  (filter ?? []).filter((leaf) => leaf.type !== "positionInTrace");
+
+/**
+ * {@link EventsRowConditions} for the events filters and the search. Both read
+ * soft-deleted rows like the rest of the host query; the streams filter
+ * `is_deleted` themselves. Throws `InvalidRequestError` for a numeric
+ * metadata filter, which this path does not offer, and `QueryCompileError`
+ * for a `positionInTrace` leaf the caller did not strip
+ * ({@link withoutPositionInTrace}).
+ */
+const compileEventsRowConditions = ({
+  projectId,
+  filter,
+  searchQuery,
+  searchType,
+}: {
+  projectId: string;
+  filter: FilterCondition[];
+  searchQuery?: string;
+  searchType?: TracingSearchType[];
+}): EventsRowConditions => {
+  rejectNumericMetadata(filter);
+  const { predicate, search } = fromFilterState({
+    filter,
+    searchQuery,
+    searchType,
+  });
+  const events =
+    predicate.children.length > 0
+      ? compileEventsPredicate(predicate, projectId)
+      : undefined;
+  const compiledSearch = search
+    ? compileEventsSearch(search, projectId)
+    : undefined;
+  return {
+    events,
+    search: compiledSearch,
+    requiresEventsFull: Boolean(
+      events?.requiresEventsFull || compiledSearch?.requiresEventsFull,
+    ),
+    startTimeFrom: startTimeFromOf(predicateConditions(predicate)),
+  };
+};
+
+/**
+ * The score level `orderBy` sorts by: `trace` for a column read from the
+ * trace score aggregate (`ts.`), `observation` for any other score column
+ * (`s.`), `undefined` when it does not sort by a score.
+ */
+const scoreOrderLevelOf = (
+  orderBy: OrderByState | undefined,
+): "observation" | "trace" | undefined => {
+  const orderByColumn = findUiColumnMapping(
+    eventsTableUiColumnDefinitions,
+    orderBy?.column,
+  );
+  if (orderByColumn?.clickhouseTableName !== "scores") return undefined;
+  return orderByColumn.clickhouseSelect.startsWith(
+    `${TRACE_SCORES_JOIN_ALIAS}.`,
+  )
+    ? "trace"
+    : "observation";
+};
+
+/**
+ * The score filters of `filterGroups` (observation scores, then trace
+ * scores) as a level-agnostic WHERE filter and the raw score rows pushdown
+ * for the score CTEs.
+ *
+ * Legacy route: unlike {@link compileEventsRowConditions}, the score filters
+ * still render as `FilterList` text, because the level-agnostic rewrite and
+ * the score-CTE pushdown have no query-AST counterpart yet. This function
+ * moves onto the AST once they do.
+ */
+const compileScoreRowConditions = ({
+  filterGroups,
+  ordersByScore,
+  includeScoreProjection,
+}: {
+  filterGroups: EventsObservationFilterGroups;
+  ordersByScore: boolean;
+  includeScoreProjection: boolean;
+}) => {
+  const rawScoreFilters = createFilterFromFilterState(
+    [...filterGroups.observationScores, ...filterGroups.traceScores],
+    eventsTableUiColumnDefinitions,
+    eventsTableCols,
+  );
+  return {
+    // Observation-scoped score filters are rewritten into a level-agnostic
+    // union across the obs (`s.`) and trace (`ts.`) score columns, for
+    // every caller of this planner (events list, blob export, stream).
+    scoreFilter: new FilterList(
+      rawScoreFilters.map(toLevelAgnosticScoreFilter),
+    ),
+    scoreRowsFilter: planScoreFilterPushdown({
+      filters: new FilterList(rawScoreFilters),
+      scoreDataRequirement: resolveScoreDataRequirement({
+        selectsScoreData: includeScoreProjection,
+        ordersByScoreData: ordersByScore,
+      }),
+    }),
+  };
+};
+
+/**
+ * The events query that selects the observation rows matching `filter`, the
+ * search and `orderBy`: it sorts the filters into groups, compiles the events
+ * filters and the search through the events predicate, and adds the
+ * observation and trace score CTEs and joins only when a score filter, a score
+ * sort or the blob-export score projection needs them. Throws
+ * `InvalidRequestError` for an unresolved comment filter, a search without a
+ * search type, or a numeric metadata filter, and `QueryCompileError` for a
+ * leftover `positionInTrace` filter.
+ */
 const buildEventsObservationRowSelectionInternal = (
   {
     projectId,
     filter,
     searchQuery,
     searchType,
+    orderBy,
   }: EventsObservationRowSelectionInput,
-  observationScoreDependencyFactory?: ObservationScoreDependencyFactory,
+  scoreProjection: ScoreProjection,
 ): {
   queryBuilder: EventsQueryBuilder;
   filterGroups: EventsObservationFilterGroups;
-  search: ReturnType<typeof eventSearchCondition>;
-  startTimeFrom: string | null;
+  rowConditions: EventsRowConditions;
 } => {
   const filterGroups = groupEventsObservationFilters(filter);
 
@@ -265,86 +450,96 @@ const buildEventsObservationRowSelectionInternal = (
       "Event comment filters must be resolved before building the ClickHouse row selection.",
     );
   }
-
-  // Observation-scoped score filters are rewritten into a level-agnostic
-  // union across the obs (`s.`) and trace (`ts.`) score columns (LFE-10596),
-  // for every caller of this planner (events list, blob export, stream).
-  const eventsFilter = new FilterList(
-    createFilterFromFilterState(
-      filter ?? [],
-      eventsTableUiColumnDefinitions,
-      eventsTableCols,
-    ).map(toLevelAgnosticScoreFilter),
-  );
-  const startTimeFrom = extractTimeFilter(eventsFilter);
-  const hasObservationScoreFilter = filterGroups.observationScores.length > 0;
-  const queryBuilder = new EventsQueryBuilder({ projectId });
-  const observationScoreDependency =
-    observationScoreDependencyFactory?.({ projectId, startTimeFrom }) ??
-    (hasObservationScoreFilter
-      ? buildObservationScoreFilterDependency({ projectId, startTimeFrom })
-      : undefined);
-  // The trace-score CTE is needed for explicit trace-only filters, for the
-  // level-agnostic union (an observation-scoped filter now references `ts.*`
-  // too), and whenever the score dependency selects `ts.*` so trace-level
-  // scores land in exports like they do in the UI's unified Scores column.
-  const hasTraceScoreFilter =
-    filterGroups.traceScores.length > 0 ||
-    hasObservationScoreFilter ||
-    Boolean(observationScoreDependency?.includeTraceScores);
-  const search = eventSearchCondition({ query: searchQuery, searchType });
-
-  if (observationScoreDependency) {
-    queryBuilder
-      .withCTE("scores_agg", observationScoreDependency.cte)
-      .leftJoin(
-        observationScoreDependency.joinTable,
-        observationScoreDependency.joinCondition,
-      );
-
-    if (observationScoreDependency.selectExpressions) {
-      queryBuilder.selectRaw(...observationScoreDependency.selectExpressions);
-    }
+  if (!hasValidTracingSearchTypes({ searchQuery, searchType })) {
+    throw new InvalidRequestError(TRACING_SEARCH_TYPE_REQUIRED_MESSAGE);
   }
 
-  queryBuilder
-    .when(hasTraceScoreFilter, (builder) =>
-      builder.withCTE(
+  const rowConditions = compileEventsRowConditions({
+    projectId,
+    filter: filterGroups.events,
+    searchQuery,
+    searchType,
+  });
+  const includeScoreProjection = scoreProjection === "blob-export";
+  const scoreOrderLevel = scoreOrderLevelOf(orderBy);
+  const ordersByObservationScore = scoreOrderLevel === "observation";
+  const ordersByTraceScore = scoreOrderLevel === "trace";
+  const { scoreFilter, scoreRowsFilter } = compileScoreRowConditions({
+    filterGroups,
+    ordersByScore: scoreOrderLevel !== undefined,
+    includeScoreProjection,
+  });
+  const startTimeFrom = rowConditions.startTimeFrom;
+  const hasObservationScoreFilter = filterGroups.observationScores.length > 0;
+  const needsObservationScores =
+    hasObservationScoreFilter ||
+    ordersByObservationScore ||
+    includeScoreProjection;
+  // Observation score filters are level-agnostic and therefore need both
+  // observation and trace aggregates. Blob exports project both explicitly.
+  const needsTraceScores =
+    filterGroups.traceScores.length > 0 ||
+    hasObservationScoreFilter ||
+    ordersByTraceScore ||
+    includeScoreProjection;
+  const queryBuilder = new EventsQueryBuilder({ projectId });
+
+  if (needsObservationScores) {
+    queryBuilder
+      .withCTE(
+        "scores_agg",
+        eventsScoresAggregation({
+          projectId,
+          startTimeFrom,
+          includeTupleEncoding: includeScoreProjection,
+          scoreRowsFilter,
+        }),
+      )
+      .leftJoin(
+        includeScoreProjection ? "scores_agg s" : "scores_agg AS s",
+        includeScoreProjection
+          ? "ON s.trace_id = e.trace_id AND s.observation_id = e.span_id"
+          : "ON s.observation_id = e.span_id",
+      );
+  }
+
+  if (needsTraceScores) {
+    queryBuilder
+      .withCTE(
         "trace_scores_agg",
         eventsTracesScoresAggregationFromObservationStart({
           projectId,
           startTimeFrom,
           hasScoreAggregationFilters: true,
-          includeTupleEncoding: Boolean(
-            observationScoreDependency?.includeTraceScores,
-          ),
+          scoreRowsFilter,
+          includeTupleEncoding: includeScoreProjection,
         }),
-      ),
-    )
-    .when(hasTraceScoreFilter, (builder) =>
-      builder.leftJoin(
-        "trace_scores_agg AS ts",
-        "ON ts.trace_id = e.trace_id AND ts.project_id = e.project_id",
-      ),
-    )
-    .when(
-      search.requiresEventsFull || filtersRequireEventsFull(eventsFilter),
-      (builder) => builder.forceFullTable(),
-    );
+      )
+      .leftJoin(
+        `trace_scores_agg AS ${TRACE_SCORES_JOIN_ALIAS}`,
+        `ON ${TRACE_SCORES_JOIN_ALIAS}.trace_id = e.trace_id AND ${TRACE_SCORES_JOIN_ALIAS}.project_id = e.project_id`,
+      );
+  }
 
-  queryBuilder.applyFilters(eventsFilter).where(search);
+  if (includeScoreProjection) {
+    queryBuilder.selectRaw(...BLOB_EXPORT_SCORE_SELECTS);
+  }
 
-  return { queryBuilder, filterGroups, search, startTimeFrom };
+  queryBuilder
+    .when(rowConditions.requiresEventsFull, (builder) =>
+      builder.forceFullTable(),
+    )
+    .where(rowConditionClause(rowConditions.events))
+    .where(scoreFilter.apply())
+    .where(rowConditionClause(rowConditions.search));
+
+  return { queryBuilder, filterGroups, rowConditions };
 };
 
 export const buildEventsObservationRowSelection = (
   input: EventsObservationRowSelectionInput,
-) => buildEventsObservationRowSelectionInternal(input);
+) => buildEventsObservationRowSelectionInternal(input, "none");
 
 export const buildEventsObservationRowSelectionForBlobExport = (
   input: EventsObservationRowSelectionInput,
-) =>
-  buildEventsObservationRowSelectionInternal(
-    input,
-    buildBlobExportObservationScoreDependency,
-  );
+) => buildEventsObservationRowSelectionInternal(input, "blob-export");

@@ -11,6 +11,7 @@
  * This is split into its own file because the env is process-wide for the file;
  * the dual-mode flag tests live in traces-trpc.servertest.ts.
  */
+import { testFeatureFlags } from "@/src/__tests__/fixtures/feature-flags";
 import { vi } from "vitest";
 
 // The events_full table is created only by the ClickHouse dev-tables setup
@@ -88,15 +89,7 @@ maybe("traces trpc (events_only write mode)", () => {
           ],
         },
       ],
-      featureFlags: {
-        excludeClickhouseRead: false,
-        templateFlag: true,
-        searchBar: false,
-        v4BetaToggleVisible: false,
-        observationEvals: false,
-        experimentsV4Enabled: false,
-      },
-      admin: true,
+      featureFlags: testFeatureFlags(),
     },
     environment: {} as any,
   };
@@ -152,6 +145,33 @@ maybe("traces trpc (events_only write mode)", () => {
       expect.arrayContaining([rootId, clickedId]),
     );
     expect(result.observations).toHaveLength(2);
+  });
+
+  it("rejects invalid agent graph timestamps as a bad request", async () => {
+    const traceId = randomUUID();
+
+    await createEventsCh([
+      createEvent({
+        id: traceId,
+        span_id: traceId,
+        trace_id: traceId,
+        project_id: projectId,
+        parent_span_id: null,
+      }),
+    ]);
+    await waitForExpect(async () => {
+      const trace = await getTraceByIdFromEventsTable({ projectId, traceId });
+      expect(trace?.id).toBe(traceId);
+    });
+
+    await expect(
+      caller.events.getAgentGraphData({
+        projectId,
+        traceId,
+        minStartTime: "'",
+        maxStartTime: "2026-08-08T22:25:00.000Z",
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
   // On a fresh events_only deployment tracing data is written ONLY to the
@@ -301,9 +321,8 @@ maybe("traces trpc (events_only write mode)", () => {
     });
   });
 
-  // Same routing as the bookmark case, but publish throws NOT_FOUND (rewrapped
-  // as INTERNAL_SERVER_ERROR) instead of silently no-opping when the read is
-  // misrouted to the empty legacy table.
+  // Same routing as the bookmark case, but publish throws NOT_FOUND instead of
+  // silently no-opping when the read is misrouted to the empty legacy table.
   it("should make a trace public that only exists in the events table", async () => {
     const traceId = randomUUID();
 

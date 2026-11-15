@@ -7,6 +7,7 @@ import {
   CategoryOptionsFilter,
   StringFilter,
   NumberFilter,
+  BooleanFilter,
   type ClickhouseOperator,
 } from "./clickhouse-sql/clickhouse-filter";
 import { z } from "zod";
@@ -14,8 +15,9 @@ import type { EventsTableFilterState } from "../../types";
 import type {
   UiColumnMappings,
   ColumnDefinition,
-} from "../../tableDefinitions";
+} from "../../tableDefinitions/types";
 import { createFilterFromFilterState } from "./clickhouse-sql/factory";
+import { eventsFieldSql } from "../repositories/events-predicate-fields";
 
 export type ApiColumnMapping = {
   id: string;
@@ -135,28 +137,35 @@ export function createPublicApiObservationsColumnMapping(
   tablePrefix: "e" | "o",
   parentFieldName: "parent_span_id" | "parent_observation_id",
 ): ApiColumnMapping[] {
-  // user_id is denormalized onto events_core/events_full, so the events_proto
-  // path filters directly without joining the traces CTE. The legacy
-  // observations table does not carry user_id, so that path still joins
-  // traces.
-  const userIdMapping: ApiColumnMapping =
+  // user_id and session_id are denormalized onto events_core/events_full, so
+  // the events_proto path filters directly without joining the traces CTE.
+  // The legacy observations table does not carry either field, so that path
+  // still joins traces.
+  const traceFieldMapping =
     tableName === "events_proto"
       ? {
-          id: "userId",
-          clickhouseSelect: "user_id",
-          filterType: "StringFilter",
           clickhouseTable: tableName,
           clickhousePrefix: tablePrefix,
         }
       : {
-          id: "userId",
-          clickhouseSelect: "user_id",
-          filterType: "StringFilter",
           clickhouseTable: "traces",
           clickhousePrefix: "t",
         };
+  const userIdMapping: ApiColumnMapping = {
+    id: "userId",
+    clickhouseSelect: "user_id",
+    filterType: "StringFilter",
+    ...traceFieldMapping,
+  };
+  const sessionIdMapping: ApiColumnMapping = {
+    id: "sessionId",
+    clickhouseSelect: "session_id",
+    filterType: "StringFilter",
+    ...traceFieldMapping,
+  };
   return [
     userIdMapping,
+    sessionIdMapping,
     {
       id: "traceId",
       clickhouseSelect: "trace_id",
@@ -192,6 +201,16 @@ export function createPublicApiObservationsColumnMapping(
       clickhouseTable: tableName,
       clickhousePrefix: tablePrefix,
     },
+    ...(tableName === "events_proto"
+      ? [
+          {
+            id: "isRootObservation",
+            clickhouseSelect: eventsFieldSql("isRootObservation"),
+            filterType: "BooleanFilter",
+            clickhouseTable: tableName,
+          },
+        ]
+      : []),
     {
       id: "fromStartTime",
       clickhouseSelect: "start_time",
@@ -342,6 +361,17 @@ export function convertApiProvidedFilterToClickhouseFilter(
           }
           break;
         }
+        case "BooleanFilter":
+          if (typeof value === "boolean") {
+            filterInstance = new BooleanFilter({
+              clickhouseTable: columnMapping.clickhouseTable,
+              field: columnMapping.clickhouseSelect,
+              operator: "=",
+              value,
+              tablePrefix: columnMapping.clickhousePrefix,
+            });
+          }
+          break;
       }
 
       filterInstance && filterList.push(filterInstance);
@@ -351,8 +381,32 @@ export function convertApiProvidedFilterToClickhouseFilter(
   return filterList;
 }
 
+type FilterColumn = {
+  clickhouseTable: string;
+  field: string;
+  tablePrefix?: string;
+};
+
+const qualifiedField = (filter: FilterColumn) =>
+  filter.tablePrefix ? `${filter.tablePrefix}.${filter.field}` : filter.field;
+
+/**
+ * Whether an advanced filter and a simple filter target the same column, so
+ * the advanced one replaces the simple one. A column reaches a filter either
+ * as a bare field plus `tablePrefix` or already qualified (`e.start_time`);
+ * both forms name the same column. Equal bare fields match whatever their
+ * prefixes: `tablePrefix` is a query alias, not part of the column identity.
+ */
+const sameColumn = (advanced: FilterColumn, simple: FilterColumn): boolean =>
+  advanced.clickhouseTable === simple.clickhouseTable &&
+  (advanced.field === simple.field ||
+    qualifiedField(advanced) === qualifiedField(simple));
+
 /**
  * Derives a merged FilterList from simple API parameters and advanced filter JSON.
+ * Simple filters come from the endpoint's named query params (`userId`,
+ * `fromStartTime`, `environment`, ...); advanced filters from its `filter`
+ * JSON param.
  * Advanced filters take precedence over simple filters when targeting the same field.
  *
  * @param simpleFilterProps - Object containing simple query parameters (e.g., { userId: "123", name: "test" })
@@ -383,12 +437,13 @@ export function deriveFilters<T extends BaseQueryType>(
     filterParamsMapping,
   );
 
-  // Advanced filter takes precedence. Remove all simple filters that are also in advanced filter
-  const advancedFilterColumns = new Set<string>();
-  filterList.forEach((f) => advancedFilterColumns.add(f.field));
-
   simpleFilters
-    .filter((sf) => !advancedFilterColumns.has(sf.field))
+    .filter(
+      (simpleFilter) =>
+        !filterList.some((advancedFilter) =>
+          sameColumn(advancedFilter, simpleFilter),
+        ),
+    )
     .forEach((f) => filterList.push(f));
 
   // Return merged filters

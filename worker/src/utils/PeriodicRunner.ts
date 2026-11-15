@@ -1,4 +1,5 @@
 import {
+  contextWithLangfuseProps,
   instrumentAsync,
   logger,
   recordDistribution,
@@ -6,7 +7,7 @@ import {
   recordIncrement,
   traceException,
 } from "@langfuse/shared/src/server";
-import { SpanKind } from "@opentelemetry/api";
+import { context as otelContext, SpanKind } from "@opentelemetry/api";
 
 const METRIC_PREFIX = "langfuse.periodic_runner";
 type RunOutcome = "success" | "failed" | "skipped";
@@ -21,9 +22,13 @@ export abstract class PeriodicRunner {
   private timeoutId: NodeJS.Timeout | null = null;
   private isRunning = false;
   private activeRun: { outcome: RunOutcome } | null = null;
+  private activeRunPromise: Promise<void> | null = null;
 
   protected abstract get name(): string;
   protected abstract get defaultIntervalMs(): number;
+  protected get initialDelayMs(): number {
+    return 0;
+  }
   protected abstract execute(): Promise<number | void>;
 
   protected constructor(
@@ -37,7 +42,11 @@ export abstract class PeriodicRunner {
     }
     this.isRunning = true;
     if (!this.activeRun) {
-      this.runAndScheduleNext();
+      if (this.initialDelayMs > 0) {
+        this.scheduleNext(this.initialDelayMs);
+      } else {
+        this.activeRunPromise = this.runAndScheduleNext();
+      }
     }
   }
 
@@ -46,6 +55,28 @@ export abstract class PeriodicRunner {
     if (this.timeoutId !== null) {
       clearTimeout(this.timeoutId);
       this.timeoutId = null;
+    }
+  }
+
+  public async drain(timeoutMs: number): Promise<void> {
+    this.stop();
+    if (!this.activeRunPromise) return;
+
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.activeRunPromise,
+        new Promise<void>((resolve) => {
+          timeout = setTimeout(() => {
+            logger.warn(`${this.name}: shutdown drain timed out`, {
+              timeoutMs,
+            });
+            resolve();
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -87,7 +118,15 @@ export abstract class PeriodicRunner {
           span.setAttribute("runner.name", this.name);
           span.setAttribute("runner.interval_ms", this.defaultIntervalMs);
 
-          const result = await this.execute();
+          const clickHouseCtx = contextWithLangfuseProps({
+            clickhouse: {
+              surface: "worker",
+              route: `${METRIC_PREFIX}.${this.metricName}`,
+            },
+          });
+          const result = await otelContext.with(clickHouseCtx, () =>
+            this.execute(),
+          );
           if (typeof result === "number") {
             nextDelayMs = result;
             span.setAttribute("runner.next_delay_ms", nextDelayMs);
@@ -141,7 +180,7 @@ export abstract class PeriodicRunner {
       return;
     }
     this.timeoutId = setTimeout(() => {
-      this.runAndScheduleNext();
+      this.activeRunPromise = this.runAndScheduleNext();
     }, delayMs);
   }
 }

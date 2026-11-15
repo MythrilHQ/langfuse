@@ -1,6 +1,8 @@
+/* eslint-disable @typescript-eslint/no-use-before-define */
 import {
   InternalServerError,
   PromptWebhookOutboundSchema,
+  SkillWebhookOutboundSchema,
   WebhookDefaultHeaders,
   ActionExecutionStatus,
   LangfuseNotFoundError,
@@ -8,16 +10,24 @@ import {
   isSlackActionConfig,
   isWebhookAction,
   isGitHubDispatchAction,
+  isPagerDutyActionConfig,
+  isBaseError,
+  TriggerEventSource,
   type AutomationDomain,
   type ActionDomainWithSecrets,
+  type PagerDutyActionConfigWithSecrets,
 } from "@langfuse/shared";
 import { decrypt, createSignatureHeader } from "@langfuse/shared/encryption";
 import { Prisma, prisma } from "@langfuse/shared/src/db";
 import {
   validateWebhookURL,
+  webhookWhitelistFromEnv,
   whitelistFromEnv,
   fetchWithSecureRedirects,
+  urlForLog,
+  type WebhookValidationWhitelist,
   WEBHOOK_URL_VALIDATION_LOG_CONTEXT,
+  buildWebhookRequestHeaders,
 } from "@langfuse/shared/src/server";
 import {
   TQueueJobTypes,
@@ -36,11 +46,34 @@ import {
 import {
   MonitorWebhookQueueEventSchema,
   buildMonitorAlertSlackMessage,
+  assertDropStaleAlert,
 } from "@langfuse/shared/monitors/server";
+import {
+  pagerDutyClient,
+  type PagerDutyRegion,
+} from "@langfuse/shared/pagerduty/server";
 import { Processor, Job } from "bullmq";
 import { backOff } from "exponential-backoff";
 import { env } from "../env";
 import { SlackMessageBuilder } from "../features/slack/slackMessageBuilder";
+import {
+  buildPagerDutyEvent,
+  type PagerDutyEvent,
+} from "../features/pagerduty/buildPagerDutyEvent";
+
+/** WEBHOOK_ADDRESS_ATTEMPT_TIMEOUT_MS lets a retransmitted SYN finish before Node closes the socket. */
+const WEBHOOK_ADDRESS_ATTEMPT_TIMEOUT_MS = 2_000;
+
+/** webhookEventSources maps each webhook payload type to the trigger event source that produced it. */
+const webhookEventSources: Record<
+  WebhookInput["payload"]["type"],
+  TriggerEventSource
+> = {
+  "prompt-version": TriggerEventSource.Prompt,
+  "skill-version": TriggerEventSource.Skill,
+  "monitor-alert": TriggerEventSource.Monitor,
+  "project-notification": TriggerEventSource.ProjectNotification,
+};
 
 // GitHub repository_dispatch client_payload: max 10 top-level properties and <64KB.
 // https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event
@@ -82,6 +115,9 @@ async function resetAutomationFailures(args: {
   await redis.del(automationFailureKey(args.projectId, args.automationId));
 }
 
+/** WebhookOutboundPayload is the validated HTTP body of a WebhookInput. */
+type WebhookOutboundPayload = ReturnType<typeof buildWebhookOutboundPayload>;
+
 /** buildWebhookOutboundPayload validates and returns the HTTP body for a WebhookInput, discriminating on payload.type. monitor-alert: the processor already built the unified envelope — pass through. prompt-version: wrap at dispatch time with id = executionId and timestamp = now. */
 function buildWebhookOutboundPayload(input: WebhookInput) {
   if (input.payload.type === "monitor-alert") {
@@ -103,6 +139,14 @@ function buildWebhookOutboundPayload(input: WebhookInput) {
       );
     }
     return parsed.data;
+  }
+  if (input.payload.type === "skill-version") {
+    return SkillWebhookOutboundSchema.parse({
+      id: input.executionId,
+      timestamp: new Date(),
+      apiVersion: "v1",
+      ...input.payload,
+    });
   }
   const promptPayload = input.payload;
   const parsed = PromptWebhookOutboundSchema.safeParse({
@@ -136,6 +180,16 @@ export const webhookProcessor: Processor = async (
   }
 };
 
+/** webhookQueueMetricTags tags webhook queue metrics with the job's event source and action type. */
+export function webhookQueueMetricTags(
+  data: TQueueJobTypes[QueueName.WebhookQueue],
+): Record<string, string> {
+  return {
+    event_source: webhookEventSources[data.payload.payload.type] ?? "unknown",
+    action_type: data.payload.actionType ?? "unknown",
+  };
+}
+
 // TODO: Webhook outgoing API versioning
 export const executeWebhook = async (
   input: WebhookInput,
@@ -158,6 +212,13 @@ export const executeWebhook = async (
       return;
     }
 
+    if (input.payload.type === "monitor-alert") {
+      await assertDropStaleAlert({
+        projectId,
+        alert: MonitorWebhookQueueEventSchema.parse(input.payload).payload,
+      });
+    }
+
     // Route to appropriate handler based on action type
     if (automation.action.type === "WEBHOOK") {
       await executeWebhookAction({
@@ -176,6 +237,8 @@ export const executeWebhook = async (
         automation,
         skipValidation: options?.skipValidation,
       });
+    } else if (automation.action.type === "PAGERDUTY") {
+      await executePagerDutyAction({ input, automation });
     } else {
       throw new InternalServerError(
         `Unsupported action type: ${automation.action.type}`,
@@ -207,6 +270,8 @@ async function executeHttpAction({
   actionConfig,
   additionalSensitiveHeaders,
   payloadType,
+  whitelist,
+  addressAttemptTimeoutMs,
 }: {
   url: string;
   payload: string;
@@ -219,6 +284,8 @@ async function executeHttpAction({
   actionConfig: ActionDomainWithSecrets;
   additionalSensitiveHeaders?: string[];
   payloadType: WebhookInput["payload"]["type"];
+  whitelist: WebhookValidationWhitelist;
+  addressAttemptTimeoutMs?: number;
 }): Promise<{ httpStatus: number; responseBody: string }> {
   // monitor-alert does not write AutomationExecution rows; auto-disable rides a Redis counter instead.
   const isMonitorAlert = payloadType === "monitor-alert";
@@ -230,7 +297,7 @@ async function executeHttpAction({
     await backOff(
       async () => {
         logger.info(
-          `Sending HTTP request to ${url} for action ${automation.action.id}`,
+          `Sending HTTP request to ${urlForLog(url)} for action ${automation.action.id}`,
         );
 
         // Create AbortController for timeout
@@ -240,8 +307,6 @@ async function executeHttpAction({
         }, env.LANGFUSE_WEBHOOK_TIMEOUT_MS);
 
         try {
-          const whitelist = whitelistFromEnv();
-
           // Skip validation when flag is set (for tests with MSW mocking)
           if (!skipValidation) {
             await validateWebhookURL(url, whitelist);
@@ -259,6 +324,7 @@ async function executeHttpAction({
                   validateUrl: validateWebhookURL,
                   whitelist,
                   logContext: WEBHOOK_URL_VALIDATION_LOG_CONTEXT,
+                  addressAttemptTimeoutMs,
                 },
                 additionalSensitiveHeaders,
               };
@@ -280,10 +346,10 @@ async function executeHttpAction({
           if (redirectResult.redirectChain.length > 0) {
             logger.info("Webhook followed redirects", {
               actionId: automation.action.id,
-              initialUrl: url,
-              finalUrl: redirectResult.finalUrl,
+              initialUrl: urlForLog(url),
+              finalUrl: urlForLog(redirectResult.finalUrl),
               redirectCount: redirectResult.redirectChain.length,
-              redirectChain: redirectResult.redirectChain,
+              redirectChain: redirectResult.redirectChain.map(urlForLog),
             });
           }
 
@@ -292,19 +358,19 @@ async function executeHttpAction({
 
           if (!res.ok) {
             logger.warn(
-              `Webhook does not return 2xx status: failed with status ${res.status} for url ${url} and project ${projectId}. Body: ${responseBody}`,
+              `Webhook does not return 2xx status: failed with status ${res.status} for url ${urlForLog(url)} and project ${projectId}. Body: ${responseBody}`,
             );
             throw new Error(
-              `Webhook does not return 2xx status: failed with status ${res.status} for url ${url} and project ${projectId}`,
+              `Webhook does not return 2xx status: failed with status ${res.status} for url ${urlForLog(url)} and project ${projectId}`,
             );
           }
         } catch (error) {
           if (error instanceof Error && error.name === "AbortError") {
             logger.warn(
-              `Webhook timeout after ${env.LANGFUSE_WEBHOOK_TIMEOUT_MS}ms for url ${url} and project ${projectId}`,
+              `Webhook timeout after ${env.LANGFUSE_WEBHOOK_TIMEOUT_MS}ms for url ${urlForLog(url)} and project ${projectId}`,
             );
             throw new Error(
-              `Webhook timeout after ${env.LANGFUSE_WEBHOOK_TIMEOUT_MS}ms for url ${url} and project ${projectId}`,
+              `Webhook timeout after ${env.LANGFUSE_WEBHOOK_TIMEOUT_MS}ms for url ${urlForLog(url)} and project ${projectId}`,
             );
           }
           throw error;
@@ -510,12 +576,12 @@ async function executeWebhookAction({
 
   const webhookConfig = actionConfig.config;
 
-  const validated = buildWebhookOutboundPayload(input);
+  const envelope = buildWebhookOutboundPayload(input);
   let webhookPayload: string;
   if (input.payload.type === "prompt-version") {
     // Prompt-version contract: prompt key always last.
-    const { prompt, user, ...otherFields } = validated as Extract<
-      typeof validated,
+    const { prompt, user, ...otherFields } = envelope as Extract<
+      typeof envelope,
       { type: "prompt-version" }
     >;
     webhookPayload = JSON.stringify({
@@ -525,32 +591,19 @@ async function executeWebhookAction({
     });
   } else {
     // monitor-alert: post the envelope verbatim.
-    webhookPayload = JSON.stringify(validated);
+    webhookPayload = JSON.stringify(envelope);
   }
 
-  // Prepare headers with signature if secret exists
-  const requestHeaders: Record<string, string> = {};
-  const additionalSensitiveHeaders: string[] = [];
-
-  // Add webhook config headers first
-  if (webhookConfig.requestHeaders) {
-    for (const [key, value] of Object.entries(webhookConfig.requestHeaders)) {
-      requestHeaders[key] = value.value;
-      if (value.secret) {
-        additionalSensitiveHeaders.push(key);
-      }
-    }
-  }
-
-  // Add default headers with precedence
-  for (const [key, value] of Object.entries(WebhookDefaultHeaders)) {
-    requestHeaders[key] = value;
-  }
-
+  let requestHeaders: Record<string, string>;
+  let additionalSensitiveHeaders: string[];
   try {
-    const decryptedSecret = decrypt(webhookConfig.secretKey);
-    const signature = createSignatureHeader(webhookPayload, decryptedSecret);
-    requestHeaders["x-langfuse-signature"] = signature;
+    const builtRequestHeaders = buildWebhookRequestHeaders({
+      customHeaders: webhookConfig.requestHeaders,
+      body: webhookPayload,
+      signingSecret: decrypt(webhookConfig.secretKey),
+    });
+    requestHeaders = builtRequestHeaders.headers;
+    additionalSensitiveHeaders = builtRequestHeaders.sensitiveHeaderNames;
   } catch (error) {
     logger.error(
       "Failed to decrypt webhook secret or generate signature",
@@ -572,7 +625,67 @@ async function executeWebhookAction({
     actionConfig,
     additionalSensitiveHeaders,
     payloadType: input.payload.type,
+    whitelist: webhookWhitelistFromEnv(),
+    addressAttemptTimeoutMs: WEBHOOK_ADDRESS_ATTEMPT_TIMEOUT_MS,
   });
+}
+
+function buildSkillDispatchPayload(
+  validated: Extract<
+    ReturnType<typeof buildWebhookOutboundPayload>,
+    { type: "skill-version" }
+  >,
+  eventType: string,
+): string {
+  let githubPayload = JSON.stringify({
+    event_type: eventType,
+    client_payload: validated,
+  });
+  if (
+    Buffer.byteLength(githubPayload, "utf8") >=
+    GITHUB_REPOSITORY_DISPATCH_MAX_PAYLOAD_BYTES
+  ) {
+    githubPayload = JSON.stringify({
+      event_type: eventType,
+      client_payload: {
+        id: validated.id,
+        timestamp: validated.timestamp,
+        type: validated.type,
+        apiVersion: validated.apiVersion,
+        action: validated.action,
+        skill: {
+          id: validated.skill.id,
+          name: validated.skill.name,
+          version: validated.skill.version,
+          projectId: validated.skill.projectId,
+        },
+        truncation: {
+          payloadTruncated: true,
+          truncatedFields: [
+            "skill.files",
+            "skill.frontmatter",
+            "skill.description",
+            "skill.tags",
+            "skill.labels",
+            "skill.commitMessage",
+            "skill.createdBy",
+            "skill.createdAt",
+            "skill.updatedAt",
+            "user",
+          ],
+        },
+      },
+    });
+  }
+  if (
+    Buffer.byteLength(githubPayload, "utf8") >=
+    GITHUB_REPOSITORY_DISPATCH_MAX_PAYLOAD_BYTES
+  ) {
+    throw new InternalServerError(
+      "Skill repository dispatch payload exceeds GitHub's size limit",
+    );
+  }
+  return githubPayload;
 }
 
 /**
@@ -609,12 +722,12 @@ async function executeGitHubDispatchAction({
 
   const githubConfig = actionConfig.config;
   const eventType = githubConfig.eventType;
-  const validated = buildWebhookOutboundPayload(input);
+  const envelope = buildWebhookOutboundPayload(input);
 
   let githubPayload: string;
   if (input.payload.type === "prompt-version") {
-    const { prompt, user, ...otherFields } = validated as Extract<
-      typeof validated,
+    const { prompt, user, ...otherFields } = envelope as Extract<
+      typeof envelope,
       { type: "prompt-version" }
     >;
     const fullGithubPayload = JSON.stringify({
@@ -645,10 +758,12 @@ async function executeGitHubDispatchAction({
               },
             },
           });
+  } else if (envelope.type === "skill-version") {
+    githubPayload = buildSkillDispatchPayload(envelope, eventType);
   } else {
     // monitor-alert: post the envelope as client_payload.
-    const monitorEnvelope = validated as Extract<
-      typeof validated,
+    const monitorEnvelope = envelope as Extract<
+      typeof envelope,
       { type: "monitor-alert" }
     >;
     const fullGithubPayload = JSON.stringify({
@@ -713,6 +828,7 @@ async function executeGitHubDispatchAction({
     executionStart,
     actionConfig,
     payloadType: input.payload.type,
+    whitelist: whitelistFromEnv(),
   });
 }
 
@@ -760,7 +876,11 @@ async function executeSlackAction({
       });
     } catch (error) {
       logger.error("Error executing Slack action", error);
-      await slackMonitorAlertFailure({ projectId, automation });
+      await monitorAlertDeliveryFailure({
+        projectId,
+        automation,
+        channel: "slack",
+      });
     }
     return;
   }
@@ -928,6 +1048,157 @@ async function executeSlackAction({
   }
 }
 
+/**
+ * Execute PagerDuty action. Events go only to the fixed PagerDuty hosts of the
+ * routing key's region. 429, 5xx and network errors are retried in-process
+ * like HTTP actions; a failure that remains counts toward trigger auto-disable.
+ */
+async function executePagerDutyAction({
+  input,
+  automation,
+}: {
+  input: WebhookInput;
+  automation: NonNullable<Awaited<ReturnType<typeof getAutomationById>>>;
+}) {
+  const { projectId, executionId } = input;
+  const executionStart = new Date();
+
+  const actionConfig = await getActionByIdWithSecrets({
+    projectId,
+    actionId: automation.action.id,
+  });
+  if (!actionConfig || !isPagerDutyActionConfig(actionConfig.config)) {
+    throw new InternalServerError("PagerDuty action config not found");
+  }
+  const config = actionConfig.config;
+
+  try {
+    const envelope = buildWebhookOutboundPayload(input);
+    const event = await buildPagerDutyDelivery({ input, envelope, config });
+    if (!event) {
+      logger.info(
+        `No PagerDuty event for ${input.payload.type} of automation ${automation.id} in project ${projectId}`,
+      );
+      return;
+    }
+    await sendPagerDutyEvent(event, config.region);
+  } catch (error) {
+    logger.error("Error executing PagerDuty action", error);
+    await recordPagerDutyFailure({ input, automation, executionStart, error });
+    return;
+  }
+
+  if (input.payload.type === "monitor-alert") {
+    await resetAutomationFailures({ projectId, automationId: automation.id });
+    return;
+  }
+  await prisma.automationExecution.update({
+    where: {
+      projectId,
+      triggerId: automation.trigger.id,
+      actionId: automation.action.id,
+      id: executionId,
+    },
+    data: {
+      status: ActionExecutionStatus.COMPLETED,
+      startedAt: executionStart,
+      finishedAt: new Date(),
+    },
+  });
+}
+
+/** buildPagerDutyDelivery decrypts the routing key and maps the job payload to its PagerDuty event. */
+async function buildPagerDutyDelivery({
+  input,
+  envelope,
+  config,
+}: {
+  input: WebhookInput;
+  envelope: WebhookOutboundPayload;
+  config: PagerDutyActionConfigWithSecrets;
+}): Promise<PagerDutyEvent | undefined> {
+  const project = await prisma.project.findUniqueOrThrow({
+    where: { id: input.projectId },
+    select: { name: true },
+  });
+  return buildPagerDutyEvent({
+    envelope,
+    projectId: input.projectId,
+    projectName: project.name,
+    routingKey: decrypt(config.routingKey),
+  });
+}
+
+/** sendPagerDutyEvent posts the event to the alert or change endpoint of the key's region. */
+async function sendPagerDutyEvent(
+  event: PagerDutyEvent,
+  region: PagerDutyRegion,
+) {
+  if (event.kind === "change") {
+    await pagerDutyClient.change({ region, event: event.event });
+    return;
+  }
+  await pagerDutyClient.alert({ region, event: event.event });
+}
+
+/** recordPagerDutyFailure records a non-retryable delivery failure and auto-disables the trigger like the other action types. */
+async function recordPagerDutyFailure({
+  input,
+  automation,
+  executionStart,
+  error,
+}: {
+  input: WebhookInput;
+  automation: NonNullable<Awaited<ReturnType<typeof getAutomationById>>>;
+  executionStart: Date;
+  error: unknown;
+}) {
+  const { projectId, executionId } = input;
+  if (input.payload.type === "monitor-alert") {
+    await monitorAlertDeliveryFailure({
+      projectId,
+      automation,
+      channel: "pagerduty",
+    });
+    return;
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.automationExecution.update({
+      where: {
+        id: executionId,
+        projectId,
+        triggerId: automation.trigger.id,
+        actionId: automation.action.id,
+      },
+      data: {
+        status: ActionExecutionStatus.ERROR,
+        startedAt: executionStart,
+        finishedAt: new Date(),
+        error: error instanceof Error ? error.message : "Unknown error",
+        output: isBaseError(error) ? { httpStatus: error.httpCode } : undefined,
+      },
+    });
+
+    // Project notifications record the error but never auto-disable.
+    if (input.payload.type === "project-notification") return;
+
+    const consecutiveFailures = await getConsecutiveAutomationFailures({
+      automationId: automation.id,
+      projectId,
+    });
+    if (consecutiveFailures >= automationFailureThreshold - 1) {
+      await tx.trigger.update({
+        where: { id: automation.trigger.id, projectId },
+        data: { status: JobConfigState.INACTIVE },
+      });
+      logger.warn(
+        `Automation ${automation.trigger.id} disabled after ${consecutiveFailures} consecutive failures in project ${projectId} (pagerduty)`,
+      );
+    }
+  });
+}
+
 /** sendSlackMonitorAlert builds and posts a monitor-alert to Slack, then clears the failure streak. */
 async function sendSlackMonitorAlert({
   payload,
@@ -983,13 +1254,15 @@ async function sendSlackProjectNotification({
   });
 }
 
-/** slackMonitorAlertFailure tracks a failed monitor-alert delivery and auto-disables the trigger past the failure threshold. */
-async function slackMonitorAlertFailure({
+/** monitorAlertDeliveryFailure tracks a failed monitor-alert delivery and auto-disables the trigger past the failure threshold. */
+async function monitorAlertDeliveryFailure({
   projectId,
   automation,
+  channel,
 }: {
   projectId: string;
   automation: NonNullable<Awaited<ReturnType<typeof getAutomationById>>>;
+  channel: "slack" | "pagerduty";
 }) {
   const count = await incrementAutomationFailure({
     projectId,
@@ -1005,7 +1278,7 @@ async function slackMonitorAlertFailure({
       automationId: automation.id,
     });
     logger.warn(
-      `Automation ${automation.trigger.id} disabled after ${count} consecutive failures in project ${projectId} (monitor-alert/slack)`,
+      `Automation ${automation.trigger.id} disabled after ${count} consecutive failures in project ${projectId} (monitor-alert/${channel})`,
     );
   }
 }

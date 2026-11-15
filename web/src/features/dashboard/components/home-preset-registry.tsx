@@ -31,8 +31,12 @@ export interface PresetWidgetContext {
   isLoading: boolean;
   metricsVersion: ViewVersion;
   schedulerId?: string;
-  /** Shared recharts syncId so time-series tiles move their crosshairs together. */
+  /** Recharts sync group for legacy preset charts. */
   syncId: string;
+  sync: {
+    activeKey: string | undefined;
+    onActiveKeyChange: (key: string | undefined) => void;
+  };
   className: string;
 }
 
@@ -91,6 +95,7 @@ const HOME_PRESETS: Record<
       metricsVersion={ctx.metricsVersion}
       schedulerId={ctx.schedulerId}
       syncId={ctx.syncId}
+      sync={ctx.sync}
     />
   ),
   "home-model-usage": (ctx) => (
@@ -106,6 +111,7 @@ const HOME_PRESETS: Record<
       metricsVersion={ctx.metricsVersion}
       schedulerId={ctx.schedulerId}
       syncId={ctx.syncId}
+      sync={ctx.sync}
     />
   ),
   "home-users": (ctx) => (
@@ -132,6 +138,7 @@ const HOME_PRESETS: Record<
       metricsVersion={ctx.metricsVersion}
       schedulerId={ctx.schedulerId}
       syncId={ctx.syncId}
+      sync={ctx.sync}
     />
   ),
   "home-latency-table-traces": (ctx) => (
@@ -185,6 +192,7 @@ const HOME_PRESETS: Record<
       metricsVersion={ctx.metricsVersion}
       schedulerId={ctx.schedulerId}
       syncId={ctx.syncId}
+      sync={ctx.sync}
     />
   ),
   "home-score-analytics": (ctx) => (
@@ -199,17 +207,27 @@ const HOME_PRESETS: Record<
       metricsVersion={ctx.metricsVersion}
       schedulerId={ctx.schedulerId}
       syncId={ctx.syncId}
+      sync={ctx.sync}
     />
   ),
 };
 
+type HomePresetMetadata = {
+  name: string;
+  description: string;
+  illustration: string;
+};
+
 /**
  * Display metadata for the preset picker (Add Widget dialog). `illustration`
- * keys into ChartTypeIllustration.
+ * keys into ChartTypeIllustration. `v2` overrides the label for a card that
+ * measures something else on the v2 read path.
  */
-export const HOME_PRESET_METADATA: Record<
+const HOME_PRESET_METADATA: Record<
   HomeDashboardPresetId,
-  { name: string; description: string; illustration: string }
+  HomePresetMetadata & {
+    v2?: Pick<HomePresetMetadata, "name" | "description">;
+  }
 > = {
   "home-traces": {
     name: "Traces",
@@ -250,6 +268,10 @@ export const HOME_PRESET_METADATA: Record<
     name: "Trace Latency Percentiles",
     description: "p50–p99 latencies per trace name",
     illustration: "PIVOT_TABLE",
+    v2: {
+      name: "Root Observation Latency Percentiles",
+      description: "p50–p99 root observation latencies per trace name",
+    },
   },
   "home-latency-table-generations": {
     name: "Generation Latency Percentiles",
@@ -272,6 +294,14 @@ export const HOME_PRESET_METADATA: Record<
     illustration: "HISTOGRAM",
   },
 };
+
+export function getHomePresetMetadata(
+  presetId: HomeDashboardPresetId,
+  version: ViewVersion,
+): HomePresetMetadata {
+  const { v2, ...metadata } = HOME_PRESET_METADATA[presetId];
+  return version === "v2" && v2 ? { ...metadata, ...v2 } : metadata;
+}
 
 export function getHomePreset(
   presetId: string,

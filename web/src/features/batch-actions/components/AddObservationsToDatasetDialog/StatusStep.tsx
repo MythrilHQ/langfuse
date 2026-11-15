@@ -1,7 +1,7 @@
 import { Button } from "@/src/components/ui/button";
 import { Progress } from "@/src/components/design-system/Progress/Progress";
 import { api } from "@/src/utils/api";
-import { StatusBadge } from "@/src/components/layouts/status-badge";
+import { StatusBadge } from "@/src/components/ui/StatusBadge/StatusBadge";
 import { BatchActionStatus } from "@langfuse/shared";
 import {
   Card,
@@ -11,8 +11,8 @@ import {
 } from "@/src/components/ui/card";
 import Link from "next/link";
 import { useRouter } from "next/router";
-import { Check, AlertCircle } from "lucide-react";
-import Spinner from "@/src/components/design-system/Spinner/Spinner";
+import { Check, AlertCircle } from "@langfuse/icons";
+import { Spinner } from "@/src/components/design-system/Spinner/Spinner";
 
 type StatusStepProps = {
   projectId: string;
@@ -71,12 +71,12 @@ export function StatusStep({
           )}
           {isSuccess && (
             <div className="mb-4 rounded-full bg-green-100 p-6 dark:bg-green-900/20">
-              <Check className="h-12 w-12 text-green-600 dark:text-green-500" />
+              <Check __rawClassName="h-12 w-12 text-green-600 dark:text-green-500" />
             </div>
           )}
           {isComplete && !isSuccess && (
             <div className="mb-4 rounded-full bg-yellow-100 p-6 dark:bg-yellow-900/20">
-              <AlertCircle className="h-12 w-12 text-yellow-600 dark:text-yellow-500" />
+              <AlertCircle __rawClassName="h-12 w-12 text-yellow-600 dark:text-yellow-500" />
             </div>
           )}
 

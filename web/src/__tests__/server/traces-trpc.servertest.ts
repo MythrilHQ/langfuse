@@ -1,3 +1,4 @@
+import { testFeatureFlags } from "@/src/__tests__/fixtures/feature-flags";
 import type { Session } from "next-auth";
 import { prisma } from "@langfuse/shared/src/db";
 import { appRouter } from "@/src/server/api/root";
@@ -59,15 +60,7 @@ describe("traces trpc", () => {
           ],
         },
       ],
-      featureFlags: {
-        excludeClickhouseRead: false,
-        templateFlag: true,
-        searchBar: false,
-        v4BetaToggleVisible: false,
-        observationEvals: false,
-        experimentsV4Enabled: false,
-      },
-      admin: true,
+      featureFlags: testFeatureFlags(),
     },
     environment: {} as any,
   };
@@ -882,6 +875,32 @@ describe("traces trpc", () => {
   });
 
   describe("traces.metrics", () => {
+    it("should not derive latency from start times when no observation has an end time", async () => {
+      const trace = createTrace({ project_id: projectId });
+      const startTime = Date.now();
+      const observations = [0, 5_000].map((offset) =>
+        createObservation({
+          project_id: projectId,
+          trace_id: trace.id,
+          type: "EVENT",
+          start_time: startTime + offset,
+          end_time: null,
+        }),
+      );
+
+      await createTracesCh([trace]);
+      await createObservationsCh(observations);
+
+      const metrics = await caller.traces.metrics({
+        projectId,
+        traceIds: [trace.id],
+        filter: [],
+      });
+
+      expect(metrics).toHaveLength(1);
+      expect(metrics[0]?.latency).toBe(0);
+    });
+
     it("should aggregate observation-only scores onto the trace row", async () => {
       const trace = createTrace({
         project_id: projectId,
@@ -967,6 +986,25 @@ describe("traces trpc", () => {
   });
 
   describe("traces.getAgentGraphData", () => {
+    it("rejects invalid agent graph timestamps as a bad request", async () => {
+      const trace = createTrace({
+        project_id: projectId,
+      });
+
+      await createTracesCh([trace]);
+
+      await expect(
+        caller.traces.getAgentGraphData({
+          projectId,
+          traceId: trace.id,
+          minStartTime: "'",
+          maxStartTime: "2026-08-08T22:25:00.000Z",
+        }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+      });
+    });
+
     it("should allow unauthenticated access to public trace agent graph data", async () => {
       const unAuthedSession = createInnerTRPCContext({
         session: null,
@@ -1291,6 +1329,19 @@ describe("traces trpc", () => {
           expect(eventTraceFull?.public).toBe(true);
         });
       }
+    });
+
+    it("returns NOT_FOUND when publishing a trace that does not exist", async () => {
+      await expect(
+        caller.traces.publish({
+          projectId,
+          traceId: randomUUID(),
+          public: true,
+        }),
+      ).rejects.toMatchObject({
+        code: "NOT_FOUND",
+        message: "Trace not found",
+      });
     });
   });
 });

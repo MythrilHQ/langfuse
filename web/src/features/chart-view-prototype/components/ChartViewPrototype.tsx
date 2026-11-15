@@ -1,8 +1,10 @@
+/* eslint-disable no-nested-ternary */
 import React, { useCallback, useMemo, useState } from "react";
-import { SlidersHorizontal } from "lucide-react";
+import { SlidersHorizontal } from "@langfuse/icons";
 import { type DashboardWidgetChartType } from "@langfuse/shared/src/db";
 import { Button } from "@/src/components/ui/button";
 import { Separator } from "@/src/components/ui/separator";
+
 // Shared, production chart-view components — the harness renders the exact same
 // UI as the real EventsChartView, fed with mock-aggregated data.
 import {
@@ -19,6 +21,7 @@ import {
   coerceConfig,
   DEFAULT_CONFIG,
   describeConfig,
+  getMetric,
   isTimeSeriesChartType,
 } from "@/src/features/chart-view/vocab";
 import {
@@ -33,7 +36,7 @@ import {
 import { aggregateEvents } from "../lib/aggregate";
 import { MockEventsTable } from "./MockEventsTable";
 
-export type ChartViewAffordance = "inline" | "panel";
+type ChartViewAffordance = "inline" | "panel";
 
 export interface ChartViewPrototypeProps {
   events: PrototypeEvent[];
@@ -75,7 +78,7 @@ export function ChartViewPrototype({
       <div className="flex shrink-0 items-center justify-between gap-2 border-b px-3 py-2">
         <div className="text-muted-foreground flex items-center gap-2 text-xs">
           <Button variant="outline" size="sm" disabled className="h-7 gap-1.5">
-            <SlidersHorizontal className="h-3.5 w-3.5" />
+            <SlidersHorizontal size="base" color="default" />
             Filters
           </Button>
           <span>{events.length.toLocaleString()} events · last 24h</span>
@@ -189,7 +192,15 @@ function InlineTake({
           {describeConfig(config)}
         </div>
         <div className="min-h-0 flex-1">
-          <ChartCanvas data={data} config={config} />
+          <ChartCanvas
+            data={data}
+            chartType={config.chartType}
+            breakdown={config.breakdown}
+            aggregation={config.aggregation}
+            metricLabel={getMetric(config.metric).label}
+            metricUnit={getMetric(config.metric).unit}
+            emptyMessage="No events match the current filters."
+          />
         </div>
       </div>
     </div>

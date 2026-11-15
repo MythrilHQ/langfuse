@@ -9,7 +9,9 @@ import {
 import {
   type DatasetItemMediaField,
   InternalServerError,
+  isBaseError,
   LangfuseNotFoundError,
+  MediaAssociationOrigin,
 } from "@langfuse/shared";
 import { Prisma, prisma } from "@langfuse/shared/src/db";
 import {
@@ -58,6 +60,7 @@ export async function createMediaUploadUrl(params: {
         observationId,
         mediaId,
         field,
+        origin: MediaAssociationOrigin.CLIENT_UPLOAD,
       });
     }
   };
@@ -77,7 +80,8 @@ export async function createMediaUploadUrl(params: {
 
     if (
       existingMedia &&
-      existingMedia.uploadHttpStatus === 200 &&
+      (existingMedia.uploadHttpStatus === 200 ||
+        existingMedia.uploadHttpStatus === 201) &&
       existingMedia.contentType === contentType
     ) {
       await linkUploadedMedia(mediaId);
@@ -126,11 +130,9 @@ export async function createMediaUploadUrl(params: {
 
     return GetMediaUploadUrlResponseSchema.parse({ mediaId, uploadUrl });
   } catch (error) {
-    if (error instanceof InternalServerError) throw error;
+    if (isBaseError(error)) throw error;
 
-    logger.error(
-      `Failed to get media upload URL for trace ${traceId} and observation ${observationId}.`,
-    );
+    logger.error("Failed to get media upload URL", error);
     throw new InternalServerError("Failed to get media upload URL");
   }
 }
@@ -192,7 +194,10 @@ export async function updateMediaUploadStatus(params: {
       data: {
         uploadedAt,
         uploadHttpStatus,
-        uploadHttpError: uploadHttpStatus === 200 ? null : uploadHttpError,
+        uploadHttpError:
+          uploadHttpStatus === 200 || uploadHttpStatus === 201
+            ? null
+            : uploadHttpError,
       },
     });
 

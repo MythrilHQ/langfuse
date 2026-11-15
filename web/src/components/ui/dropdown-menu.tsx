@@ -1,20 +1,15 @@
+/* eslint-disable @repo/no-style-props, @repo/no-margin-on-root-elements, @repo/component-file-structure */
 "use client";
 
 import * as React from "react";
 import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu";
 import { cva } from "class-variance-authority";
-import {
-  Check,
-  ChevronRight,
-  Circle,
-  Minus,
-  type LucideIcon,
-} from "lucide-react";
+import { Check, Minus, type IconComponent } from "@langfuse/icons";
+import { DropdownIndicator } from "@/src/components/design-system/DropdownIndicator/DropdownIndicator";
 import Link from "next/link";
 
 import { cn } from "@/src/utils/tailwind";
-import { useLayerContainer } from "@/src/components/ui/layer";
-import { Skeleton } from "@/src/components/ui/skeleton";
+import { useLayerContainer } from "@/src/context/LayerContext/LayerContext";
 import { useScrollGradients } from "@/src/hooks/useScrollGradients";
 
 const DropdownMenu = DropdownMenuPrimitive.Root;
@@ -48,14 +43,18 @@ const DropdownMenuSubTrigger = React.forwardRef<
   <DropdownMenuPrimitive.SubTrigger
     ref={ref}
     className={cn(
-      "focus:bg-accent data-[state=open]:bg-accent flex cursor-default items-center rounded-sm px-2 py-1.5 text-sm outline-hidden select-none",
+      "focus:bg-accent data-[state=open]:bg-accent flex cursor-pointer items-center rounded-sm px-2 py-1.5 text-sm outline-hidden select-none data-disabled:cursor-not-allowed",
       inset && "pl-8",
       className,
     )}
     {...props}
   >
     {children}
-    {!hasCustomIcon && <ChevronRight className="ml-auto h-4 w-4" />}
+    {!hasCustomIcon && (
+      <span className="ml-auto flex">
+        <DropdownIndicator direction="right" />
+      </span>
+    )}
   </DropdownMenuPrimitive.SubTrigger>
 ));
 DropdownMenuSubTrigger.displayName =
@@ -136,20 +135,28 @@ const DropdownContentWrapper = React.forwardRef<
     const { register, recompute, top, bottom } = useScrollGradients<
       React.ComponentRef<typeof DropdownMenuPrimitive.Content>
     >(maxHeight !== undefined);
+    const setContentRef = React.useCallback(
+      (
+        element: React.ComponentRef<
+          typeof DropdownMenuPrimitive.Content
+        > | null,
+      ) => {
+        register(element);
+        if (typeof ref === "function") {
+          ref(element);
+        } else if (ref) {
+          ref.current = element;
+        }
+      },
+      [ref, register],
+    );
     const content =
       typeof children === "function" ? children({ top, bottom }) : children;
 
     return (
       <DropdownMenuPrimitive.Portal container={container}>
         <DropdownMenuPrimitive.Content
-          ref={(element) => {
-            register(element);
-            if (typeof ref === "function") {
-              ref(element);
-            } else if (ref) {
-              ref.current = element;
-            }
-          }}
+          ref={setContentRef}
           sideOffset={sideOffset}
           className={cn(
             dropdownMenuContentVariants({
@@ -252,18 +259,67 @@ const DropdownMenuContent = React.forwardRef<
 DropdownMenuContent.displayName = DropdownMenuPrimitive.Content.displayName;
 
 /**
+ * Owns dropdown open state while callers retain trigger and menu presentation.
+ * Use the supplied primitives in each render prop to preserve Radix behavior.
+ */
+type DropdownMenuControllerProps = {
+  align: React.ComponentProps<typeof DropdownMenuContent>["align"];
+  isActive?: boolean;
+  children: (control: {
+    isOpen: boolean;
+    Trigger: typeof DropdownMenuTrigger;
+  }) => React.ReactNode;
+  maxWidth?: React.CSSProperties["maxWidth"];
+  /** Customizes Radix focus restoration after the menu closes. */
+  onCloseAutoFocus?: React.ComponentProps<
+    typeof DropdownMenuContent
+  >["onCloseAutoFocus"];
+  renderMenu: () => React.ReactNode;
+};
+
+const DropdownMenuController = ({
+  align,
+  isActive = true,
+  children,
+  maxWidth,
+  onCloseAutoFocus,
+  renderMenu,
+}: DropdownMenuControllerProps) => {
+  const [isOpen, setIsOpen] = React.useState(false);
+
+  return (
+    <DropdownMenu open={isActive && isOpen} onOpenChange={setIsOpen}>
+      {children({ isOpen: isActive && isOpen, Trigger: DropdownMenuTrigger })}
+      <DropdownMenuContent
+        align={align}
+        style={maxWidth === undefined ? undefined : { maxWidth }}
+        onClick={(event) => event.stopPropagation()}
+        onCloseAutoFocus={(event) => {
+          if (!isActive) event.preventDefault();
+          onCloseAutoFocus?.(event);
+        }}
+      >
+        {renderMenu()}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+};
+
+/**
  * Prefer `DropdownMenuItemWithSecondaryAction` for items that do not require JSX content.
  */
 const DropdownMenuItem = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.Item>,
   React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Item> & {
+    allowPointerEventsWhenDisabled?: boolean;
     inset?: boolean;
   }
->(({ className, inset, ...props }, ref) => (
+>(({ allowPointerEventsWhenDisabled, className, inset, ...props }, ref) => (
   <DropdownMenuPrimitive.Item
     ref={ref}
     className={cn(
-      "focus:bg-accent focus:text-accent-foreground relative flex cursor-default items-center rounded-sm px-2 py-1.5 text-sm outline-hidden transition-colors select-none data-disabled:pointer-events-none data-disabled:opacity-50",
+      "focus:bg-accent focus:text-accent-foreground relative flex cursor-pointer items-center rounded-sm px-2 py-1.5 text-sm outline-hidden transition-colors select-none data-disabled:cursor-not-allowed data-disabled:opacity-50",
+      !allowPointerEventsWhenDisabled && "data-disabled:pointer-events-none",
       inset && "pl-8",
       className,
     )}
@@ -281,22 +337,29 @@ type DropdownMenuItemAction = {
 } & (
   | {
       href: React.ComponentProps<typeof Link>["href"];
+      target?: React.ComponentProps<typeof Link>["target"];
       onClick?: never;
     }
   | {
       href?: never;
+      target?: never;
       onClick: () => void;
     }
 );
 
 type DropdownMenuItemWithSecondaryActionProps = {
-  icon?: LucideIcon;
+  noCapture?: boolean;
+  disabled?: { reason: string };
+  icon?: IconComponent;
   title: string;
   secondaryAction?: DropdownMenuItemAction & {
     ariaLabel?: string;
-    icon: LucideIcon;
+    icon: IconComponent;
   };
 } & DropdownMenuItemAction;
+
+const relForTarget = (target: React.ComponentProps<typeof Link>["target"]) =>
+  target === "_blank" ? "noopener noreferrer" : undefined;
 
 const dropdownMenuItemPrimaryActionVariants = cva(
   "flex min-w-0 flex-1 cursor-pointer items-center px-2 py-1.5",
@@ -312,69 +375,93 @@ const DropdownMenuItemWithSecondaryAction = (
   const secondaryAction = props.secondaryAction;
   const PrimaryActionIcon = props.icon;
   const SecondaryActionIcon = secondaryAction?.icon;
+  const isDisabled = props.disabled !== undefined;
   const primaryActionRef = React.useRef<HTMLAnchorElement | HTMLButtonElement>(
     null,
   );
   const primaryContent = (
     <>
       {PrimaryActionIcon && (
-        <PrimaryActionIcon className="mr-1.5 size-4" aria-hidden="true" />
+        <PrimaryActionIcon
+          size="base"
+          color="default"
+          __rawClassName="mr-1.5"
+          aria-hidden="true"
+        />
       )}
       <span
-        className="max-w-36 overflow-hidden text-ellipsis whitespace-nowrap"
-        title={props.title}
+        className="min-w-0 flex-1 overflow-hidden text-left text-ellipsis whitespace-nowrap"
+        title={props.disabled?.reason ?? props.title}
       >
         {props.title}
       </span>
     </>
   );
-  let secondaryActionContent: React.ReactNode = null;
-
-  // The secondary action is intentionally pointer-only and cannot be targeted
-  // with the keyboard; the parent remains the row's sole menu item.
-  if (secondaryAction && SecondaryActionIcon) {
+  const secondaryActionContent = React.useMemo(() => {
+    // The secondary action is intentionally pointer-only and cannot be targeted
+    // with the keyboard; the parent remains the row's sole menu item.
+    if (!secondaryAction || !SecondaryActionIcon) return null;
     if (secondaryAction.href !== undefined) {
-      secondaryActionContent = (
+      return (
         <Link
           href={secondaryAction.href}
+          target={secondaryAction.target}
+          rel={relForTarget(secondaryAction.target)}
           aria-label={secondaryAction.ariaLabel}
+          aria-disabled={isDisabled}
+          tabIndex={isDisabled ? -1 : undefined}
           className={dropdownMenuItemSecondaryActionVariants()}
           onClick={(event) => {
             event.stopPropagation();
+            if (isDisabled) {
+              event.preventDefault();
+              return;
+            }
             secondaryAction.onBeforeAction?.();
           }}
           onAuxClick={(event) => {
             event.stopPropagation();
+            if (isDisabled) {
+              event.preventDefault();
+              return;
+            }
             if (event.button === 1) {
               secondaryAction.onBeforeAction?.();
             }
           }}
         >
-          <SecondaryActionIcon size={12} />
+          <SecondaryActionIcon size="sm" color="default" />
         </Link>
       );
-    } else {
-      secondaryActionContent = (
-        <button
-          type="button"
-          aria-label={secondaryAction.ariaLabel}
-          className={dropdownMenuItemSecondaryActionVariants()}
-          onClick={(event) => {
-            event.stopPropagation();
-            secondaryAction.onBeforeAction?.();
-            secondaryAction.onClick();
-          }}
-        >
-          <SecondaryActionIcon size={12} />
-        </button>
-      );
     }
-  }
+    return (
+      <button
+        type="button"
+        aria-label={secondaryAction.ariaLabel}
+        disabled={isDisabled}
+        className={dropdownMenuItemSecondaryActionVariants()}
+        onClick={(event) => {
+          event.stopPropagation();
+          secondaryAction.onBeforeAction?.();
+          secondaryAction.onClick();
+        }}
+      >
+        <SecondaryActionIcon size="sm" color="default" />
+      </button>
+    );
+  }, [secondaryAction, SecondaryActionIcon, isDisabled]);
 
   return (
     <DropdownMenuItem
-      className="h-8 p-0"
+      allowPointerEventsWhenDisabled
+      className={cn(
+        "h-8 p-0 data-disabled:cursor-not-allowed",
+        props.noCapture && "ph-no-capture",
+      )}
+      disabled={isDisabled}
+      title={props.disabled?.reason}
       onClick={(event) => {
+        if (isDisabled) return;
         if (event.target !== event.currentTarget) return;
 
         event.preventDefault();
@@ -387,11 +474,23 @@ const DropdownMenuItemWithSecondaryAction = (
             primaryActionRef.current = element;
           }}
           href={props.href}
+          target={props.target}
+          rel={relForTarget(props.target)}
+          aria-disabled={isDisabled}
+          tabIndex={isDisabled ? -1 : undefined}
           className={dropdownMenuItemPrimaryActionVariants()}
-          onClick={() => {
+          onClick={(event) => {
+            if (isDisabled) {
+              event.preventDefault();
+              return;
+            }
             props.onBeforeAction?.();
           }}
           onAuxClick={(event) => {
+            if (isDisabled) {
+              event.preventDefault();
+              return;
+            }
             if (event.button === 1) {
               props.onBeforeAction?.();
             }
@@ -405,6 +504,7 @@ const DropdownMenuItemWithSecondaryAction = (
             primaryActionRef.current = element;
           }}
           type="button"
+          disabled={isDisabled}
           className={dropdownMenuItemPrimaryActionVariants()}
           onClick={() => {
             props.onBeforeAction?.();
@@ -420,12 +520,6 @@ const DropdownMenuItemWithSecondaryAction = (
   );
 };
 
-const DropdownMenuLoadingItem = () => (
-  <DropdownMenuItem disabled aria-label="Loading">
-    <Skeleton variant="contrast" className="h-4 w-24" />
-  </DropdownMenuItem>
-);
-
 const DropdownMenuCheckboxItem = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.CheckboxItem>,
   React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.CheckboxItem>
@@ -433,7 +527,7 @@ const DropdownMenuCheckboxItem = React.forwardRef<
   <DropdownMenuPrimitive.CheckboxItem
     ref={ref}
     className={cn(
-      "focus:bg-accent focus:text-accent-foreground relative flex cursor-default items-center rounded-sm py-1.5 pr-2 pl-8 text-sm outline-hidden transition-colors select-none data-disabled:pointer-events-none data-disabled:opacity-50",
+      "focus:bg-accent focus:text-accent-foreground relative flex cursor-pointer items-center rounded-sm py-1.5 pr-2 pl-8 text-sm outline-hidden transition-colors select-none data-disabled:pointer-events-none data-disabled:opacity-50",
       className,
     )}
     checked={checked}
@@ -441,8 +535,8 @@ const DropdownMenuCheckboxItem = React.forwardRef<
   >
     <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
       <DropdownMenuPrimitive.ItemIndicator>
-        {checked === "indeterminate" && <Minus className="h-4 w-4" />}
-        {checked === true && <Check className="h-4 w-4" />}
+        {checked === "indeterminate" && <Minus size="base" color="default" />}
+        {checked === true && <Check size="base" color="default" />}
       </DropdownMenuPrimitive.ItemIndicator>
     </span>
     {children}
@@ -458,14 +552,14 @@ const DropdownMenuRadioItem = React.forwardRef<
   <DropdownMenuPrimitive.RadioItem
     ref={ref}
     className={cn(
-      "focus:bg-accent focus:text-accent-foreground relative flex cursor-default items-center rounded-sm py-1.5 pr-2 pl-8 text-sm outline-hidden transition-colors select-none data-disabled:pointer-events-none data-disabled:opacity-50",
+      "focus:bg-accent focus:text-accent-foreground relative flex cursor-pointer items-center rounded-sm py-1.5 pr-2 pl-8 text-sm outline-hidden transition-colors select-none data-disabled:pointer-events-none data-disabled:opacity-50",
       className,
     )}
     {...props}
   >
     <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
       <DropdownMenuPrimitive.ItemIndicator>
-        <Circle className="h-2 w-2 fill-current" />
+        <span className="size-2 rounded-full bg-current" aria-hidden />
       </DropdownMenuPrimitive.ItemIndicator>
     </span>
     {children}
@@ -514,16 +608,15 @@ DropdownMenuShortcut.displayName = "DropdownMenuShortcut";
 
 export {
   DropdownMenu,
+  DropdownMenuController,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuItemWithSecondaryAction,
-  DropdownMenuLoadingItem,
   DropdownMenuCheckboxItem,
   DropdownMenuRadioItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
-  DropdownMenuShortcut,
   DropdownMenuGroup,
   DropdownMenuPortal,
   DropdownMenuSub,

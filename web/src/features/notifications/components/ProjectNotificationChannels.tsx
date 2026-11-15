@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-deprecated -- Legacy UI usage retained during migration to design-system components. */
 import Header from "@/src/components/layouts/header";
 import { Button } from "@/src/components/ui/button";
 import {
@@ -10,38 +11,49 @@ import {
   DialogTitle,
 } from "@/src/components/ui/dialog";
 import { Switch } from "@/src/components/design-system/Switch/Switch";
-import { AutomationForm } from "@/src/features/automations/components/automationForm";
+import { AutomationForm } from "@/src/features/automations/components/AutomationForm";
 import { WebhookSecretRender } from "@/src/features/automations/components/WebhookSecretRender";
 import { ProjectNotificationChannelsList } from "@/src/features/notifications/components/ProjectNotificationChannelsList";
 import { useProjectNotificationChannels } from "@/src/features/notifications/hooks/useProjectNotificationChannels";
 import { cn } from "@/src/utils/tailwind";
 import {
+  ProjectNotificationEventTypeSchema,
   TriggerEventSource,
   type ActionTypes,
   type ProjectNotificationEventType,
 } from "@langfuse/shared";
 
-/** Project notifications route to webhooks or Slack; GitHub dispatch is not wired for this event source. */
-const PROJECT_NOTIFICATION_ACTION_TYPES: ActionTypes[] = ["WEBHOOK", "SLACK"];
+/** Project notifications route to webhooks, Slack or PagerDuty; GitHub dispatch is not wired for this event source. */
+const PROJECT_NOTIFICATION_ACTION_TYPES: ActionTypes[] = [
+  "WEBHOOK",
+  "SLACK",
+  "PAGERDUTY",
+];
 
-/** NOTIFIED_EVENTS lists the toggleable project-notification events, keyed by their eventType. */
-const NOTIFIED_EVENTS: {
-  value: ProjectNotificationEventType;
-  title: string;
-  description: string;
-}[] = [
-  {
-    value: "blob-export-failed",
+const NOTIFIED_EVENT_COPY: Record<
+  ProjectNotificationEventType,
+  { title: string; description: string }
+> = {
+  "blob-export-failed": {
     title: "Blob storage export failed",
     description: "Sent when a scheduled blob storage export fails.",
   },
-  {
-    value: "evaluator-blocked",
+  "posthog-export-failed": {
+    title: "PostHog export failed",
+    description:
+      "Sent when a PostHog export is disabled after a configuration error, such as an unreachable host.",
+  },
+  "evaluator-blocked": {
     title: "Evaluator deactivated",
     description:
       "Sent when an evaluator is deactivated due to an unrecoverable error, such as a deleted model or LLM connection.",
   },
-];
+};
+
+/** NOTIFIED_EVENTS lists the toggleable project-notification events, in schema order. */
+export const NOTIFIED_EVENTS = ProjectNotificationEventTypeSchema.options.map(
+  (value) => ({ value, ...NOTIFIED_EVENT_COPY[value] }),
+);
 
 /**
  * ProjectNotificationChannels is the admin-only "Project Notifications"
@@ -54,7 +66,6 @@ export function ProjectNotificationChannels({
   projectId: string;
 }) {
   const {
-    hasAccess,
     channels,
     isLoading,
     mode,
@@ -67,8 +78,6 @@ export function ProjectNotificationChannels({
   } = useProjectNotificationChannels(projectId);
 
   const hasChannels = Boolean(channels?.length);
-
-  if (!hasAccess) return null;
 
   return (
     <div>

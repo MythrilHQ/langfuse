@@ -1,5 +1,7 @@
+/* eslint-disable @typescript-eslint/no-use-before-define */
 import { TRPCError } from "@trpc/server";
 
+import { areDestinationUrlsEquivalent } from "@/src/features/automations/destinationUrl";
 import {
   type WebCalloutEndpointInput,
   type WebCalloutInvokeInput,
@@ -21,13 +23,14 @@ import {
   withWebCalloutInFlightLimit,
   type WebCalloutLimitContext,
 } from "@/src/features/web-callouts/server/rateLimit";
+import { LangfuseUserAgent } from "@langfuse/shared";
 import { fetchWithSecureRedirects, logger } from "@langfuse/shared/src/server";
 import {
   type PrismaClient,
   type WebCalloutEndpoint,
 } from "@langfuse/shared/src/db";
 
-export const WEB_CALLOUT_TIMEOUT_MS = 5_000;
+const WEB_CALLOUT_TIMEOUT_MS = 5_000;
 const WEB_CALLOUT_MAX_REDIRECTS = 10;
 
 type StoredEndpoint = WebCalloutEndpoint;
@@ -109,14 +112,19 @@ export const upsertWebCalloutEndpoint = async ({
     });
   }
 
+  // Stored header values are only sent to the URL they were entered for.
+  const isUrlChanged =
+    !!existingEndpoint &&
+    !areDestinationUrlsEquivalent(existingEndpoint.url, input.url);
   const shouldMergeExistingHeaders =
-    Object.keys(input.requestHeaders).length > 0;
+    !isUrlChanged && Object.keys(input.requestHeaders).length > 0;
   const headers = processHeadersForStorage({
     inputHeaders: input.requestHeaders,
     existingHeaders:
       existingEndpoint && shouldMergeExistingHeaders
         ? decryptWebCalloutHeaders(existingEndpoint.requestHeaders)
         : {},
+    isUrlChanged,
   });
 
   const data = {
@@ -205,7 +213,7 @@ export const invokeWebCalloutEndpoint = async ({
     const decryptedHeaders = decryptWebCalloutHeaders(endpoint.requestHeaders);
     const outboundHeaders = new Headers();
     outboundHeaders.set("Content-Type", "application/json");
-    outboundHeaders.set("User-Agent", "Langfuse/1.0");
+    outboundHeaders.set("User-Agent", LangfuseUserAgent);
 
     for (const [name, value] of Object.entries(decryptedHeaders)) {
       outboundHeaders.set(name, value);

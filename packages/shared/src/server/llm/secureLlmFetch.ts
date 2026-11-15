@@ -2,11 +2,14 @@ import {
   CircularRedirectError,
   fetchWithSecureRedirects,
   MaxRedirectsExceededError,
-  OutboundUrlValidationError,
   RedirectValidationError,
-  type OutboundUrlValidationWhitelist,
+} from "../outbound-url/fetch";
+import {
+  getOutboundProxyDispatcher,
   type RequestInitWithDispatcher,
-} from "../outbound-url";
+} from "../outbound-url/connection";
+import { OutboundUrlValidationError } from "../outbound-url/validation";
+
 import {
   llmBaseUrlWhitelistFromEnv,
   validateLlmConnectionBaseURL,
@@ -16,27 +19,21 @@ import { LLMValidationError } from "./errors";
 const MAX_LLM_REDIRECTS = 10;
 
 type SecureLlmFetchParams = {
-  whitelist?: OutboundUrlValidationWhitelist;
   logContext: string;
   additionalSensitiveHeaders?: string[];
-  dispatcher?: unknown;
 };
 
 export function createSecureLlmFetch({
-  whitelist = llmBaseUrlWhitelistFromEnv(),
   logContext,
   additionalSensitiveHeaders,
-  dispatcher,
 }: SecureLlmFetchParams): typeof fetch {
   return async (input, init) => {
     try {
       const { url, options } = await normalizeFetchInput(input, init);
 
       return await fetchSecureLlmUrl(url, options, {
-        whitelist,
         logContext,
         additionalSensitiveHeaders,
-        dispatcher,
       });
     } catch (cause) {
       const validationError = findSecureLlmValidationError(cause);
@@ -58,20 +55,27 @@ export function createSecureLlmFetch({
 export async function fetchSecureLlmUrl(
   url: string,
   options: RequestInit,
-  {
-    whitelist = llmBaseUrlWhitelistFromEnv(),
-    logContext,
-    additionalSensitiveHeaders,
-    dispatcher,
-  }: SecureLlmFetchParams,
+  { logContext, additionalSensitiveHeaders }: SecureLlmFetchParams,
 ): Promise<Response> {
+  const whitelist = llmBaseUrlWhitelistFromEnv();
   await validateLlmConnectionBaseURL(url, whitelist);
   const optionsWithoutDispatcher = stripCallerDispatcher(options);
-  // If we have a proxy dispatcher (HTTPS_PROXY), attach it here so the
-  // outbound connection traverses the operator's proxy. Otherwise
-  // fetchWithSecureRedirects will inject the secure-lookup dispatcher.
-  const fetchOptions: RequestInit = dispatcher
-    ? ({ ...optionsWithoutDispatcher, dispatcher } as RequestInit)
+  // If the operator configured HTTPS_PROXY, attach the NO_PROXY-aware proxy
+  // dispatcher: proxied origins traverse the operator's proxy while NO_PROXY
+  // matches connect directly through the secure-lookup dispatcher. Without a
+  // proxy, fetchWithSecureRedirects will inject the secure-lookup dispatcher.
+  // Typed as unknown at this boundary: fetch's RequestInit types dispatcher
+  // via undici-types, which structurally drifts from the undici package's
+  // Dispatcher across versions.
+  const proxyDispatcher: unknown = getOutboundProxyDispatcher({
+    whitelist,
+    logContext,
+  });
+  const fetchOptions: RequestInit = proxyDispatcher
+    ? ({
+        ...optionsWithoutDispatcher,
+        dispatcher: proxyDispatcher,
+      } as RequestInit)
     : optionsWithoutDispatcher;
 
   const { response } = await fetchWithSecureRedirects(url, fetchOptions, {

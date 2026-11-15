@@ -19,7 +19,10 @@ import {
   getLLMErrorInfo,
   testModelCall,
 } from "@langfuse/shared/src/server";
-import { getEvaluatorDefinitionPreflightError } from "@/src/features/evals/server/evaluator-preflight";
+import {
+  getEvaluatorDefinitionConfigurationError,
+  getEvaluatorDefinitionPreflightError,
+} from "@/src/features/evals/server/evaluator-preflight";
 
 const numericOutputDefinition = createNumericEvalOutputDefinition({
   reasoningDescription: "Why the score was assigned",
@@ -107,6 +110,20 @@ describe("evaluator preflight", () => {
     expect(mockTestModelCall).not.toHaveBeenCalled();
   });
 
+  it("validates evaluator configuration without calling the provider", async () => {
+    const result = await getEvaluatorDefinitionConfigurationError({
+      projectId: "project_test",
+      template: {
+        name: "Answer correctness",
+        outputDefinition: numericOutputDefinition,
+      },
+    });
+
+    expect(result).toBeNull();
+    expect(mockFetchValidModelConfig).toHaveBeenCalledOnce();
+    expect(mockTestModelCall).not.toHaveBeenCalled();
+  });
+
   it("preserves actionable output definition validation errors", async () => {
     const result = await getEvaluatorDefinitionPreflightError({
       projectId: "project_test",
@@ -130,7 +147,7 @@ describe("evaluator preflight", () => {
     expect(mockGetLLMErrorInfo).not.toHaveBeenCalled();
   });
 
-  describe("live provider call failures", () => {
+  describe("live provider calls", () => {
     // The preflight skips the provider call in test-like environments;
     // stub these so the mocked testModelCall is actually reached.
     beforeEach(() => {
@@ -140,6 +157,21 @@ describe("evaluator preflight", () => {
 
     afterEach(() => {
       vi.unstubAllEnvs();
+    });
+
+    it("limits the non-streaming model call to 95 seconds", async () => {
+      const result = await getEvaluatorDefinitionPreflightError({
+        projectId: "project_test",
+        template: {
+          name: "Answer correctness",
+          outputDefinition: numericOutputDefinition,
+        },
+      });
+
+      expect(result).toBeNull();
+      expect(mockTestModelCall).toHaveBeenCalledWith(
+        expect.objectContaining({ timeout: 95_000 }),
+      );
     });
 
     it("returns a clean model-not-found message when the provider responds with 404", async () => {
@@ -195,24 +227,124 @@ describe("evaluator preflight", () => {
       );
     });
 
-    it("does not expose unknown model call errors", async () => {
+    it("rethrows retryable provider failures", async () => {
+      const providerError = new Error("429 Rate limit reached");
+      mockTestModelCall.mockRejectedValue(providerError);
+      mockGetLLMErrorInfo.mockReturnValue({
+        kind: "provider",
+        message: "429 Rate limit reached",
+        statusCode: 429,
+        isRetryable: true,
+        error: providerError,
+      });
+
+      await expect(
+        getEvaluatorDefinitionPreflightError(
+          {
+            projectId: "project_test",
+            template: {
+              name: "Answer correctness",
+              outputDefinition: numericOutputDefinition,
+            },
+          },
+          {
+            throwOnOperationalError: true,
+          },
+        ),
+      ).rejects.toBe(providerError);
+    });
+
+    it("returns retryable provider failures for activation callers", async () => {
+      const providerError = new Error("429 Rate limit reached");
+      mockTestModelCall.mockRejectedValue(providerError);
+      mockGetLLMErrorInfo.mockReturnValue({
+        kind: "provider",
+        message: "429 Rate limit reached",
+        statusCode: 429,
+        isRetryable: true,
+        error: providerError,
+      });
+
+      await expect(
+        getEvaluatorDefinitionPreflightError({
+          projectId: "project_test",
+          template: {
+            name: "Answer correctness",
+            outputDefinition: numericOutputDefinition,
+          },
+        }),
+      ).resolves.toBe(
+        `Model configuration not valid for evaluator "Answer correctness". 429 Rate limit reached`,
+      );
+    });
+
+    it.each(["timeout", "abort"] as const)(
+      "rethrows %s failures",
+      async (kind) => {
+        const operationalError = new Error(`${kind} during model call`);
+        mockTestModelCall.mockRejectedValue(operationalError);
+        mockGetLLMErrorInfo.mockReturnValue({
+          kind,
+          message: operationalError.message,
+          isRetryable: false,
+          error: operationalError,
+        });
+
+        await expect(
+          getEvaluatorDefinitionPreflightError(
+            {
+              projectId: "project_test",
+              template: {
+                name: "Answer correctness",
+                outputDefinition: numericOutputDefinition,
+              },
+            },
+            {
+              throwOnOperationalError: true,
+            },
+          ),
+        ).rejects.toBe(operationalError);
+      },
+    );
+
+    it("rethrows unknown model call errors without exposing them", async () => {
+      const unknownError = new Error("sensitive internal model call detail");
+      mockTestModelCall.mockRejectedValue(unknownError);
+      mockGetLLMErrorInfo.mockReturnValue(null);
+
+      await expect(
+        getEvaluatorDefinitionPreflightError(
+          {
+            projectId: "project_test",
+            template: {
+              name: "Answer correctness",
+              outputDefinition: numericOutputDefinition,
+            },
+          },
+          {
+            throwOnOperationalError: true,
+          },
+        ),
+      ).rejects.toBe(unknownError);
+    });
+
+    it("hides unknown model call errors from activation callers", async () => {
       mockTestModelCall.mockRejectedValue(
         new Error("sensitive internal model call detail"),
       );
       mockGetLLMErrorInfo.mockReturnValue(null);
 
-      const result = await getEvaluatorDefinitionPreflightError({
-        projectId: "project_test",
-        template: {
-          name: "Answer correctness",
-          outputDefinition: numericOutputDefinition,
-        },
-      });
-
-      expect(result).toBe(
+      await expect(
+        getEvaluatorDefinitionPreflightError({
+          projectId: "project_test",
+          template: {
+            name: "Answer correctness",
+            outputDefinition: numericOutputDefinition,
+          },
+        }),
+      ).resolves.toBe(
         `Model configuration not valid for evaluator "Answer correctness". An internal error occurred`,
       );
-      expect(result).not.toContain("sensitive internal model call detail");
     });
   });
 });

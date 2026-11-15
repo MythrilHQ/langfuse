@@ -1,4 +1,5 @@
-import { RotateCw, Sparkles, X } from "lucide-react";
+/* eslint-disable @repo/no-style-props */
+import { RotateCw, Sparkles, X } from "@langfuse/icons";
 import { Button } from "@/src/components/ui/button";
 import { cn } from "@/src/utils/tailwind";
 
@@ -20,8 +21,7 @@ export type VersionUpdateBannerViewProps = {
  * instead of overlapping it.
  *
  * Purely props-driven (no store/context/data) so it renders in isolation — see
- * `VersionUpdateBannerView.stories.tsx`. The connected {@link VersionUpdateBanner}
- * wires it to the store, the overlay layer, and analytics.
+ * `VersionUpdateBannerView.stories.tsx`.
  *
  * We prompt rather than auto-reload: reloading would discard unsaved work (open
  * annotations, editors); the user reloads when it is safe for them.
@@ -35,6 +35,9 @@ export function VersionUpdateBannerView({
     <div
       role="status"
       aria-live="polite"
+      // Peek (and any other dismissable overlay) must not close when this
+      // banner is dismissed — it lives in a higher overlay layer than the peek.
+      data-ignore-outside-interaction
       className={cn(
         // `top-banner-offset` = safe-area + any registered top banner's height,
         // so the pill sits below a full-width top banner (e.g. PaymentBanner)
@@ -51,12 +54,12 @@ export function VersionUpdateBannerView({
         className,
       )}
     >
-      <Sparkles className="text-primary h-4 w-4 shrink-0" />
+      <Sparkles size="base" __rawClassName="text-primary" />
       <span className="text-foreground text-sm whitespace-nowrap">
         Langfuse just got an update
       </span>
       <Button size="sm" className="rounded-full" onClick={onReload}>
-        <RotateCw className="mr-1.5 h-3.5 w-3.5" />
+        <RotateCw size="base" __rawClassName="mr-1.5" />
         Reload
       </Button>
       <Button
@@ -67,7 +70,7 @@ export function VersionUpdateBannerView({
         aria-label="Dismiss"
         title="Dismiss"
       >
-        <X className="h-4 w-4" />
+        <X size="base" color="default" />
       </Button>
     </div>
   );

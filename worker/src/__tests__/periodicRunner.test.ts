@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { context as otelContext, type Context } from "@opentelemetry/api";
 
 const telemetry = vi.hoisted(() => ({
+  contextWithLangfuseProps: vi.fn(),
   recordDistribution: vi.fn(),
   recordGauge: vi.fn(),
   recordIncrement: vi.fn(),
@@ -9,6 +11,7 @@ const telemetry = vi.hoisted(() => ({
 }));
 
 vi.mock("@langfuse/shared/src/server", () => ({
+  contextWithLangfuseProps: telemetry.contextWithLangfuseProps,
   getCurrentSpan: vi.fn(() => telemetry.span),
   instrumentAsync: vi.fn(
     (
@@ -31,6 +34,20 @@ vi.mock("@langfuse/shared/src/server", () => ({
 
 import { PeriodicRunner } from "../utils/PeriodicRunner";
 import { PeriodicExclusiveRunner } from "../utils/PeriodicExclusiveRunner";
+
+// Tracks the context `otelContext.with` activates, so a test can tell whether
+// `execute()` runs inside it.
+const activeContexts: Context[] = [];
+vi.spyOn(otelContext, "with").mockImplementation(
+  (ctx, fn, thisArg, ...args) => {
+    activeContexts.push(ctx);
+    try {
+      return fn.call(thisArg, ...args);
+    } finally {
+      activeContexts.pop();
+    }
+  },
+);
 
 /**
  * Helper to flush microtasks without advancing timers
@@ -68,6 +85,8 @@ class TestRunner extends PeriodicRunner {
   public callCount = 0;
   public shouldThrow = false;
   public returnInterval: number | undefined = undefined;
+  public initialDelayMsForTest = 0;
+  public executeContext: Context | undefined;
 
   constructor() {
     super("test_runner");
@@ -81,8 +100,13 @@ class TestRunner extends PeriodicRunner {
     return 1000;
   }
 
+  protected get initialDelayMs(): number {
+    return this.initialDelayMsForTest;
+  }
+
   protected async execute(): Promise<number | void> {
     this.callCount++;
+    this.executeContext = activeContexts.at(-1);
     if (this.shouldThrow) {
       this.shouldThrow = false; // Only throw once
       throw new Error("Test error");
@@ -149,12 +173,21 @@ describe("PeriodicRunner", () => {
   });
 
   it("should call execute on start and record canonical metrics", async () => {
+    const clickHouseContext = {} as Context;
+    telemetry.contextWithLangfuseProps.mockReturnValue(clickHouseContext);
     const runner = new TestRunner();
 
     runner.start();
     await flushMicrotasks();
 
     expect(runner.callCount).toBe(1);
+    expect(runner.executeContext).toBe(clickHouseContext);
+    expect(telemetry.contextWithLangfuseProps).toHaveBeenCalledWith({
+      clickhouse: {
+        surface: "worker",
+        route: "langfuse.periodic_runner.test_runner",
+      },
+    });
     expect(telemetry.recordIncrement).toHaveBeenCalledWith(
       "langfuse.periodic_runner.started",
       1,
@@ -175,6 +208,19 @@ describe("PeriodicRunner", () => {
       Date.now() / 1000,
       { runner: "test_runner", unit: "seconds" },
     );
+    runner.stop();
+  });
+
+  it("should delay the initial execution when configured", async () => {
+    const runner = new TestRunner();
+    runner.initialDelayMsForTest = 250;
+
+    runner.start();
+    await vi.advanceTimersByTimeAsync(249);
+    expect(runner.callCount).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(runner.callCount).toBe(1);
     runner.stop();
   });
 
