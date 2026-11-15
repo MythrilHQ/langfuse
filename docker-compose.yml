@@ -1,13 +1,11 @@
-# Make sure to update the credential placeholders with your own secrets.
-# We mark them with # CHANGEME in the file below.
-# In addition, we recommend to restrict inbound traffic on the host to langfuse-web (port 3000), minio (port 9090)
-# and langfuse-ai-gateway (port 3031, or LANGFUSE_AI_GATEWAY_PORT) only.
-# LANGFUSE_IMAGE_TAG pins langfuse-web, langfuse-worker and langfuse-ai-gateway to the same release, which must be newer than 4.75.0 (older web images hide the gateway even with both keys set).
-# All other components are bound to localhost (127.0.0.1) to only accept connections from the local machine.
-# External connections from other machines will not be able to reach these services directly.
+# Mythril production stack for Langfuse v4, deployed by .github/workflows/ci-cd.yml with
+# docker-compose.traefik.yml. Secrets come from the LANGFUSE_ENV_FILE environment secret.
+# LANGFUSE_IMAGE_TAG pins langfuse-web and langfuse-worker to the same release (default 4.80.0).
+# The upstream langfuse-ai-gateway service is intentionally not deployed.
+# Only langfuse-web is published, on 127.0.0.1; Traefik serves it publicly.
 services:
   langfuse-worker:
-    image: docker.langfuse.com/langfuse/langfuse-worker:${LANGFUSE_IMAGE_TAG:-4}
+    image: docker.langfuse.com/langfuse/langfuse-worker:${LANGFUSE_IMAGE_TAG:-4.80.0}
     restart: always
     depends_on: &langfuse-depends-on
       postgres:
@@ -20,13 +18,29 @@ services:
         condition: service_healthy
     ports:
       - 127.0.0.1:3030:3030
+    healthcheck:
+      # Also fails when the v4 dual-write propagation job stops making progress. The worker
+      # listens on the container hostname (Docker sets HOSTNAME), not on 127.0.0.1.
+      test: ["CMD-SHELL", "wget -q --spider \"http://$${HOSTNAME}:3030/api/health?failIfEventPropagationStuck=true\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     environment: &langfuse-worker-env
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
       DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/postgres} # CHANGEME
       SALT: ${SALT:-mysalt} # CHANGEME
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000} # CHANGEME: generate via `openssl rand -hex 32`
-      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-true}
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-false}
       LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}
+      # Langfuse v4 migration (https://langfuse.com/self-hosting/upgrade/upgrade-guides/upgrade-v3-to-v4).
+      # dual: ingestion writes the v3 tables and the v4 events tables, so v3 data stays visible
+      # and older SDKs keep working. Cut over later by setting events_only / direct.
+      LANGFUSE_MIGRATION_V4_WRITE_MODE: ${LANGFUSE_MIGRATION_V4_WRITE_MODE:-dual}
+      LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR: ${LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR:-dual_write}
+      LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN: ${LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN:-true}
+      # No historic backfill: it needs ~3x ClickHouse disk. Keep false, also after the cutover.
+      LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL: ${LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL:-false}
       # Lets the worker reach the web service internally for in-app agent MCP
       # calls without redirecting NEXTAUTH_URL, which also builds links for
       # users. Pair it with LANGFUSE_MCP_ALLOWED_HOSTS on langfuse-web.
@@ -127,16 +141,21 @@ services:
       LANGFUSE_IN_APP_AGENT_SANDBOX_AWS_LAMBDA_MICROVM_REGION: ${LANGFUSE_IN_APP_AGENT_SANDBOX_AWS_LAMBDA_MICROVM_REGION:-}
 
   langfuse-web:
-    image: docker.langfuse.com/langfuse/langfuse:${LANGFUSE_IMAGE_TAG:-4}
+    image: docker.langfuse.com/langfuse/langfuse:${LANGFUSE_IMAGE_TAG:-4.80.0}
     restart: always
     depends_on: *langfuse-depends-on
     ports:
-      - 3000:3000
+      - "127.0.0.1:${LANGFUSE_WEB_HOST_PORT:-3000}:3000"
     environment:
       <<: *langfuse-worker-env
+      HOSTNAME: 0.0.0.0
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-mysecret} # CHANGEME
       LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://localhost:9090}
       LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT:-http://minio:9000}
+      AUTH_DISABLE_SIGNUP: ${AUTH_DISABLE_SIGNUP:-true}
+      AUTH_SESSION_MAX_AGE: ${AUTH_SESSION_MAX_AGE:-720}
+      LANGFUSE_CSP_ENFORCE_HTTPS: ${LANGFUSE_CSP_ENFORCE_HTTPS:-true}
+      LANGFUSE_RATE_LIMITS_ENABLED: ${LANGFUSE_RATE_LIMITS_ENABLED:-true}
       LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
       LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
       LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
@@ -175,41 +194,8 @@ services:
       LANGFUSE_AI_GATEWAY_ENABLED: ${LANGFUSE_AI_GATEWAY_ENABLED:-}
       LANGFUSE_AI_GATEWAY_ORGANIZATION_ID_ALLOWLIST: ${LANGFUSE_AI_GATEWAY_ORGANIZATION_ID_ALLOWLIST:-}
 
-  langfuse-ai-gateway:
-    # LANGFUSE_AI_GATEWAY_IMAGE_TAG overrides the shared tag, e.g. if a release lacks a gateway image.
-    image: docker.langfuse.com/langfuse/ai-gateway:${LANGFUSE_AI_GATEWAY_IMAGE_TAG:-${LANGFUSE_IMAGE_TAG:-4}}
-    restart: always
-    depends_on:
-      - langfuse-web
-    ports:
-      # LANGFUSE_AI_GATEWAY_PORT (a port number) sets the port inside the container and on the host.
-      - ${LANGFUSE_AI_GATEWAY_PORT:-3031}:${LANGFUSE_AI_GATEWAY_PORT:-3031}
-    environment:
-      # Fixed to the internal service: plain HTTP is allowed only because this address stays
-      # on the private Docker network, and Web's responses carry provider API keys.
-      # Left empty without a service key, so gateway images that predate
-      # LANGFUSE_AI_GATEWAY_ALLOW_MISSING_SERVICE_KEY also start unconfigured.
-      LANGFUSE_AI_GATEWAY_WEB_URL: ${LANGFUSE_AI_GATEWAY_SERVICE_KEY:+http://langfuse-web:3000}
-      LANGFUSE_AI_GATEWAY_ALLOW_HTTP_WEB_URL: "true"
-      LANGFUSE_AI_GATEWAY_LISTEN_ADDRESS: 0.0.0.0:${LANGFUSE_AI_GATEWAY_PORT:-3031}
-      # Without the key the gateway starts unconfigured: inference returns 503.
-      LANGFUSE_AI_GATEWAY_SERVICE_KEY: ${LANGFUSE_AI_GATEWAY_SERVICE_KEY:-}
-      LANGFUSE_AI_GATEWAY_ALLOW_MISSING_SERVICE_KEY: "true"
-      LANGFUSE_AI_GATEWAY_CONNECTION_DRAIN_TIMEOUT_SECONDS: ${LANGFUSE_AI_GATEWAY_CONNECTION_DRAIN_TIMEOUT_SECONDS:-30}
-      LANGFUSE_AI_GATEWAY_TELEMETRY_SHUTDOWN_TIMEOUT_SECONDS: ${LANGFUSE_AI_GATEWAY_TELEMETRY_SHUTDOWN_TIMEOUT_SECONDS:-20}
-      LANGFUSE_LOG_LEVEL: ${LANGFUSE_AI_GATEWAY_LOG_LEVEL:-info}
-    # Must exceed the connection drain plus the telemetry flush; raise it with either timeout.
-    stop_grace_period: ${LANGFUSE_AI_GATEWAY_STOP_GRACE_PERIOD:-60s}
-    healthcheck:
-      # Liveness, not /ready: a gateway without keys is unconfigured by design.
-      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:${LANGFUSE_AI_GATEWAY_PORT:-3031}/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
-
   clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:26.3.62.3
+    image: docker.io/clickhouse/clickhouse-server:25.12
     restart: always
     user: "101:101"
     environment:
@@ -219,6 +205,7 @@ services:
     volumes:
       - langfuse_clickhouse_data:/var/lib/clickhouse
       - langfuse_clickhouse_logs:/var/log/clickhouse-server
+      - ./clickhouse-system-logs.xml:/etc/clickhouse-server/config.d/system-logs.xml:ro
     ports:
       - 127.0.0.1:8123:8123
       - 127.0.0.1:9000:9000
@@ -239,7 +226,7 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret} # CHANGEME
     ports:
-      - 9090:9000
+      - 127.0.0.1:9090:9000
       - 127.0.0.1:9091:9001
     volumes:
       - langfuse_minio_data:/data

@@ -1,0 +1,168 @@
+name: Cleanup Legacy Langfuse Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Environment to clean up
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+      scope:
+        description: Preserve data volumes or delete them permanently
+        required: true
+        type: choice
+        default: runtime-only
+        options:
+          - runtime-only
+          - including-data
+      confirmation:
+        description: "Enter cleanup-<target>-runtime or delete-<target>-data"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: langfuse-cleanup-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Cleanup ${{ inputs.target }} (${{ inputs.scope }})
+    runs-on:
+      - self-hosted
+      - Linux
+      - ARM64
+      - langfuse-runner
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate cleanup request
+        id: plan
+        env:
+          TARGET: ${{ inputs.target }}
+          SCOPE: ${{ inputs.scope }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+
+          case "$TARGET" in
+            development)
+              project="langfuse"
+              ;;
+            staging)
+              project="langfuse-staging"
+              ;;
+            *)
+              echo "Unsupported cleanup target: $TARGET" >&2
+              exit 1
+              ;;
+          esac
+
+          case "$SCOPE" in
+            runtime-only)
+              expected_confirmation="cleanup-${TARGET}-runtime"
+              remove_volumes="false"
+              ;;
+            including-data)
+              expected_confirmation="delete-${TARGET}-data"
+              remove_volumes="true"
+              ;;
+            *)
+              echo "Unsupported cleanup scope: $SCOPE" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ "$CONFIRMATION" != "$expected_confirmation" ]; then
+            echo "Confirmation must exactly match: $expected_confirmation" >&2
+            exit 1
+          fi
+
+          {
+            echo "project=$project"
+            echo "remove_volumes=$remove_volumes"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Cleanup plan"
+            echo "- Target: \`$TARGET\`"
+            echo "- Compose project: \`$project\`"
+            echo "- Scope: \`$SCOPE\`"
+            echo "- Delete persistent volumes: \`$remove_volumes\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Inventory selected project
+        env:
+          COMPOSE_PROJECT_NAME: ${{ steps.plan.outputs.project }}
+        run: |
+          set -euo pipefail
+          echo "Containers:"
+          docker ps --all --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+            --format 'table {{.Names}}\t{{.Status}}'
+          echo "Volumes:"
+          docker volume ls --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
+            --format 'table {{.Name}}'
+
+      - name: Remove runtime resources and preserve data
+        if: steps.plan.outputs.remove_volumes == 'false'
+        env:
+          COMPOSE_PROJECT_NAME: ${{ steps.plan.outputs.project }}
+        run: |
+          set -euo pipefail
+          docker compose --project-name "$COMPOSE_PROJECT_NAME" -f docker-compose.yml \
+            down --remove-orphans --timeout 30
+
+      - name: Remove runtime resources and data volumes
+        if: steps.plan.outputs.remove_volumes == 'true'
+        env:
+          COMPOSE_PROJECT_NAME: ${{ steps.plan.outputs.project }}
+        run: |
+          set -euo pipefail
+          docker compose --project-name "$COMPOSE_PROJECT_NAME" -f docker-compose.yml \
+            down --remove-orphans --volumes --timeout 30
+
+      - name: Verify cleanup
+        env:
+          COMPOSE_PROJECT_NAME: ${{ steps.plan.outputs.project }}
+          REMOVE_VOLUMES: ${{ steps.plan.outputs.remove_volumes }}
+        run: |
+          set -euo pipefail
+
+          remaining_containers=$(docker ps --all --quiet \
+            --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME")
+          if [ -n "$remaining_containers" ]; then
+            echo "Cleanup left project containers behind: $remaining_containers" >&2
+            exit 1
+          fi
+
+          if [ "$REMOVE_VOLUMES" = "true" ]; then
+            remaining_volumes=$(docker volume ls --quiet \
+              --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME")
+            if [ -n "$remaining_volumes" ]; then
+              echo "Cleanup left project volumes behind: $remaining_volumes" >&2
+              exit 1
+            fi
+
+            for volume_suffix in \
+              langfuse_postgres_data \
+              langfuse_clickhouse_data \
+              langfuse_clickhouse_logs \
+              langfuse_minio_data \
+              langfuse_redis_data; do
+              volume_name="${COMPOSE_PROJECT_NAME}_${volume_suffix}"
+              if docker volume inspect "$volume_name" >/dev/null 2>&1; then
+                echo "Cleanup left declared volume behind: $volume_name" >&2
+                exit 1
+              fi
+            done
+          fi
+
+          echo "Cleanup completed for Compose project: $COMPOSE_PROJECT_NAME"

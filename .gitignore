@@ -136,3 +136,5 @@ ds-bundle/
 
 # local redis snapshots
 dump.rdb
+
+local/
