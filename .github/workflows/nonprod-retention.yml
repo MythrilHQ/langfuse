@@ -1,0 +1,57 @@
+name: Non-production trace retention
+
+# Langfuse's built-in data retention needs an Enterprise license, so this job
+# keeps non-production projects on the production host to a fixed window.
+# Production projects are protected and never touched.
+
+on:
+  schedule:
+    # Daily at 21:30 UTC (03:00 Asia/Colombo), outside working hours in both offices.
+    - cron: "30 21 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only report what would be deleted
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: langfuse-nonprod-retention
+  cancel-in-progress: false
+
+jobs:
+  retention:
+    name: Delete non-production traces older than 14 days
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - langfuse-runner-prod
+    timeout-minutes: 60
+    env:
+      COMPOSE_PROJECT_NAME: langfuse-prod
+      RETENTION_DAYS: "14"
+      # Mythril Staging, Mythril Development, Mythril Wander Development, Mythril Wander Staging
+      PROJECT_IDS: >-
+        cms5olvu10009tt07e7pswiue
+        cms5oicge0003tt07cp6rsx6j
+        cmvepk0kk0008qt070e3f00yj
+        cmvt7yt42000eqt07cct3zla4
+      # Mythril Production, Mythril Wander Production
+      PROTECTED_PROJECT_IDS: >-
+        mythril-production
+        cmw8pc0ra000kqt074xlo8k6k
+      EVENT_BUCKET: langfuse
+      EVENT_PREFIX: events/
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Apply retention
+        run: bash .github/scripts/nonprod-retention.sh
