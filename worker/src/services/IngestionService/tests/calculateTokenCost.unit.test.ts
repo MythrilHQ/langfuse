@@ -1,6 +1,6 @@
 import Decimal from "decimal.js";
 import { v4 as uuidv4 } from "uuid";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Price } from "@langfuse/shared";
 import { prisma } from "@langfuse/shared/src/db";
@@ -33,6 +33,12 @@ vi.mock("../../ClickhouseWriter", async (importOriginal) => {
     },
   };
 });
+
+const sdkAttribution = {
+  ingestionApiKey: "pk-lf-test",
+  ingestionSdkName: "unknown",
+  ingestionSdkVersion: "unknown",
+};
 
 const mockIngestionService = new IngestionService(
   null as any,
@@ -121,314 +127,6 @@ describe("Token Cost Calculation", () => {
     vi.clearAllMocks();
   });
 
-  it("should correctly calculate token costs with provided model prices", async () => {
-    const prices = await prisma.price.findMany({
-      where: {
-        modelId,
-      },
-    });
-
-    const usageUnits = {
-      input: 100,
-      output: 200,
-      total: 300,
-    };
-
-    const userProvidedCosts = {
-      input: null,
-      output: null,
-      total: null,
-    };
-
-    const costs = (IngestionService as any).calculateUsageCosts(
-      prices as any,
-      userProvidedCosts,
-      usageUnits,
-    );
-
-    expect(costs.cost_details.input).toBe(1.0); // 100 tokens * 0.01
-    expect(costs.cost_details.output).toBe(4.0); // 200 tokens * 0.02
-    expect(costs.cost_details.total).toBe(9.0); // 300 tokens * 0.03
-    expect(costs.total_cost).toBe(9.0);
-  });
-
-  it("should correctly calculate token costs with user provided costs", async () => {
-    const prices = await prisma.price.findMany({
-      where: {
-        modelId,
-      },
-    });
-
-    const usageUnits = {
-      input: 100,
-      output: 200,
-      total: 300,
-    };
-
-    const userProvidedCosts = {
-      input: 2.0,
-      output: 3.0,
-      total: 5.0,
-    };
-
-    const costs = (IngestionService as any).calculateUsageCosts(
-      prices as any,
-      { provided_cost_details: userProvidedCosts },
-      usageUnits,
-    );
-
-    expect(costs.cost_details.input).toBe(2.0); // Overridden by user provided cost
-    expect(costs.cost_details.output).toBe(3.0); // Overridden by user provided cost
-    expect(costs.cost_details.total).toBe(5.0); // Overridden by user provided cost
-    expect(costs.total_cost).toBe(5.0);
-  });
-
-  it("should correctly calculate token costs when only some user provided costs are given", async () => {
-    const prices = await prisma.price.findMany({
-      where: {
-        modelId,
-      },
-    });
-
-    const data = [
-      // missing total
-      {
-        userProvidedCosts: {
-          input: 1,
-          output: 2,
-        },
-        expectedCost: {
-          input_cost: 1,
-          output_cost: 2,
-          total_cost: 3,
-        },
-      },
-      // only total
-      {
-        userProvidedCosts: {
-          total: 2,
-        },
-        expectedCost: {
-          total_cost: 2,
-        },
-      },
-      // missing input
-      {
-        userProvidedCosts: {
-          output: 2,
-          total: 2,
-        },
-        expectedCost: {
-          output_cost: 2,
-          total_cost: 2,
-        },
-      },
-      // only input
-      {
-        userProvidedCosts: {
-          input: 1,
-        },
-        expectedCost: {
-          input_cost: 1,
-          total_cost: 1,
-        },
-      },
-
-      // missing output
-      {
-        userProvidedCosts: {
-          input: 1,
-          total: 1,
-        },
-        expectedCost: {
-          input_cost: 1,
-          output_cost: undefined,
-          total_cost: 1,
-        },
-      },
-
-      // only output
-      {
-        userProvidedCosts: {
-          output: 2,
-        },
-        expectedCost: {
-          input_cost: undefined,
-          output_cost: 2,
-          total_cost: 2,
-        },
-      },
-    ];
-
-    for (const { userProvidedCosts, expectedCost } of data) {
-      const usageUnits = {
-        input: 0,
-        output: 0,
-        total: 0,
-      };
-
-      const costs = (IngestionService as any).calculateUsageCosts(
-        prices as any,
-        { provided_cost_details: userProvidedCosts } as any,
-        usageUnits,
-      );
-
-      expect(costs.cost_details.input).toBe(expectedCost.input_cost);
-      expect(costs.cost_details.output).toBe(expectedCost.output_cost);
-      expect(costs.cost_details.total).toBe(expectedCost.total_cost);
-      expect(costs.total_cost).toBe(expectedCost.total_cost);
-    }
-  });
-
-  it("should return empty costs if no model is provided", async () => {
-    const usageUnits = {
-      input: 100,
-      output: 200,
-      total: 300,
-    };
-
-    const userProvidedCosts = {
-      input: null,
-      output: null,
-      total: null,
-    };
-
-    const costs = (IngestionService as any).calculateUsageCosts(
-      null,
-      userProvidedCosts,
-      usageUnits,
-    );
-
-    expect(costs.cost_details.input).toBeUndefined();
-    expect(costs.cost_details.output).toBeUndefined();
-    expect(costs.cost_details.total).toBeUndefined();
-    expect(costs.total_cost).toBeUndefined();
-  });
-
-  it("should handle zero token counts correctly", async () => {
-    const prices = await prisma.price.findMany({
-      where: {
-        modelId,
-      },
-    });
-
-    const usageUnits = {
-      input: 0,
-      output: 0,
-      total: 0,
-    };
-
-    const userProvidedCosts = {
-      input: null,
-      output: null,
-      total: null,
-    };
-
-    const costs = (IngestionService as any).calculateUsageCosts(
-      prices as any,
-      userProvidedCosts,
-      usageUnits,
-    );
-
-    expect(costs.cost_details.input).toBe(0); // 0 tokens * 0.01
-    expect(costs.cost_details.output).toBe(0); // 0 tokens * 0.02
-    expect(costs.cost_details.total).toBe(0); // 0 tokens * 0.03
-    expect(costs.total_cost).toBe(0);
-  });
-
-  it("should handle missing token counts correctly", async () => {
-    const prices = await prisma.price.findMany({
-      where: {
-        modelId,
-      },
-    });
-
-    const usageUnits = {
-      input: undefined,
-      output: undefined,
-      total: undefined,
-    };
-
-    const userProvidedCosts = {
-      input: null,
-      output: null,
-      total: null,
-    };
-
-    const costs = (IngestionService as any).calculateUsageCosts(
-      prices as any,
-      userProvidedCosts,
-      usageUnits,
-    );
-
-    expect(costs.cost_details.input).toBeUndefined();
-    expect(costs.cost_details.output).toBeUndefined();
-    expect(costs.cost_details.total).toBeUndefined();
-    expect(costs.total_cost).toBeUndefined();
-  });
-
-  it("should handle fractional token counts correctly", async () => {
-    const prices = await prisma.price.findMany({
-      where: {
-        modelId,
-      },
-    });
-
-    const usageUnits = {
-      input: 150.5,
-      output: 250.25,
-      total: 400.75,
-    };
-
-    const userProvidedCosts = {
-      input: null,
-      output: null,
-      total: null,
-    };
-
-    const costs = (IngestionService as any).calculateUsageCosts(
-      prices as any,
-      userProvidedCosts,
-      usageUnits,
-    );
-
-    expect(costs.cost_details.input).toBeCloseTo(1.505); // 150.5 tokens * 0.01
-    expect(costs.cost_details.output).toBeCloseTo(5.005); // 250.25 tokens * 0.02
-    expect(costs.cost_details.total).toBeCloseTo(12.0225); // 400.75 tokens * 0.03
-    expect(costs.total_cost).toBeCloseTo(12.0225);
-  });
-
-  it("should handle large token counts correctly", async () => {
-    const prices = await prisma.price.findMany({
-      where: {
-        modelId,
-      },
-    });
-
-    const usageUnits = {
-      input: 1e6,
-      output: 2e6,
-      total: 3e6,
-    };
-
-    const userProvidedCosts = {
-      input: null,
-      output: null,
-      total: null,
-    };
-
-    const costs = (IngestionService as any).calculateUsageCosts(
-      prices as any,
-      userProvidedCosts,
-      usageUnits,
-    );
-
-    expect(costs.cost_details.input).toBe(10000); // 1e6 tokens * 0.01
-    expect(costs.cost_details.output).toBe(40000); // 2e6 tokens * 0.02
-    expect(costs.cost_details.total).toBe(90000); // 3e6 tokens * 0.03
-    expect(costs.total_cost).toBe(90000);
-  });
-
   it("should correctly match model prices from the database", async () => {
     const generationUsage = {
       model: modelName,
@@ -459,6 +157,7 @@ describe("Token Cost Calculation", () => {
       entityId: generationId,
       createdAtTimestamp: new Date(),
       observationEventList: events,
+      attribution: sdkAttribution,
     });
     expect(mockAddToClickhouseWriter).toHaveBeenCalled();
     const args = mockAddToClickhouseWriter.mock.calls[0];
@@ -540,6 +239,7 @@ describe("Token Cost Calculation", () => {
       entityId: generationId,
       createdAtTimestamp: new Date(),
       observationEventList: events,
+      attribution: sdkAttribution,
     });
     expect(mockAddToClickhouseWriter).toHaveBeenCalled();
     const args = mockAddToClickhouseWriter.mock.calls[0];
@@ -574,7 +274,7 @@ describe("Token Cost Calculation", () => {
     expect(generation.usage_details.total).toBe(generationUsage2.usage.total);
   });
 
-  it("should correctly handle first manual tokenization and then provided tokens", async () => {
+  it("should apply provided tokens after an initial update without usage", async () => {
     const generationUsage1 = {
       model: modelName,
       input: "hello world",
@@ -619,6 +319,7 @@ describe("Token Cost Calculation", () => {
       entityId: generationId,
       createdAtTimestamp: new Date(),
       observationEventList: events,
+      attribution: sdkAttribution,
     });
     expect(mockAddToClickhouseWriter).toHaveBeenCalled();
     const args = mockAddToClickhouseWriter.mock.calls[0];
@@ -700,6 +401,7 @@ describe("Token Cost Calculation", () => {
       entityId: generationId,
       createdAtTimestamp: new Date(),
       observationEventList: events,
+      attribution: sdkAttribution,
     });
     expect(mockAddToClickhouseWriter).toHaveBeenCalled();
     const args = mockAddToClickhouseWriter.mock.calls[0];
@@ -784,6 +486,7 @@ describe("Token Cost Calculation", () => {
       entityId: generationId,
       createdAtTimestamp: new Date(),
       observationEventList: events,
+      attribution: sdkAttribution,
     });
     expect(mockAddToClickhouseWriter).toHaveBeenCalled();
     const args = mockAddToClickhouseWriter.mock.calls[0];
@@ -874,6 +577,7 @@ describe("Token Cost Calculation", () => {
       entityId: generationId,
       createdAtTimestamp: new Date(),
       observationEventList: events,
+      attribution: sdkAttribution,
     });
     expect(mockAddToClickhouseWriter).toHaveBeenCalled();
     const args = mockAddToClickhouseWriter.mock.calls[0];
@@ -959,6 +663,7 @@ describe("Token Cost Calculation", () => {
       entityId: generationId,
       createdAtTimestamp: new Date(),
       observationEventList: events,
+      attribution: sdkAttribution,
     });
     expect(mockAddToClickhouseWriter).toHaveBeenCalled();
     const args = mockAddToClickhouseWriter.mock.calls[0];
@@ -1041,6 +746,7 @@ describe("Token Cost Calculation", () => {
       entityId: generationId,
       createdAtTimestamp: new Date(),
       observationEventList: events,
+      attribution: sdkAttribution,
     });
     expect(mockAddToClickhouseWriter).toHaveBeenCalled();
     const args = mockAddToClickhouseWriter.mock.calls[0];
@@ -1128,6 +834,7 @@ describe("Token Cost Calculation", () => {
       entityId: generationId,
       createdAtTimestamp: new Date(),
       observationEventList: events,
+      attribution: sdkAttribution,
     });
     expect(mockAddToClickhouseWriter).toHaveBeenCalled();
     const args = mockAddToClickhouseWriter.mock.calls[0];
@@ -1200,6 +907,7 @@ describe("Token Cost Calculation", () => {
       entityId: generationId,
       createdAtTimestamp: new Date(),
       observationEventList: events,
+      attribution: sdkAttribution,
     });
     expect(mockAddToClickhouseWriter).toHaveBeenCalled();
     const args = mockAddToClickhouseWriter.mock.calls[0];
@@ -1233,13 +941,12 @@ describe("Token Cost Calculation", () => {
     expect(generation.usage_details.total).toBe(generationUsage1.usage.total);
   });
 
-  it("should skip tokenization and cost calculation if generation status is ERROR", async () => {
+  it("should leave usage and cost unknown for a generation written to the observations table", async () => {
     const generationUsage1 = {
       model: modelName,
       input: "hello world",
       output: "hey whassup",
       usage: null,
-      level: "ERROR",
     };
 
     const events = [
@@ -1260,6 +967,7 @@ describe("Token Cost Calculation", () => {
       entityId: generationId,
       createdAtTimestamp: new Date(),
       observationEventList: events,
+      attribution: sdkAttribution,
     });
 
     expect(mockAddToClickhouseWriter).toHaveBeenCalled();
@@ -1270,7 +978,6 @@ describe("Token Cost Calculation", () => {
     expect(tableName).toBe("observations");
     expect(generation).toBeDefined();
     expect(generation.type).toBe("GENERATION");
-    expect(generation.level).toBe("ERROR");
 
     // Model name should be matched
     expect(generation.internal_model_id).toBe(tokenModelData.id);
@@ -1288,6 +995,125 @@ describe("Token Cost Calculation", () => {
     expect(generation.usage_details.input).toBeUndefined();
     expect(generation.usage_details.output).toBeUndefined();
     expect(generation.usage_details.total).toBeUndefined();
+  });
+
+  describe("usage and cost behavior for missing and submitted usage", () => {
+    const gatewayScope = { name: "langfuse-ai-gateway", version: "0.1.0" };
+    const gatewayAttribution = {
+      ...sdkAttribution,
+      ingestionApiKey: "gateway:grant-1",
+    };
+
+    it("should leave usage and cost unknown when a generation submits no usage", async () => {
+      const eventRecord = await (mockIngestionService as any).createEventRecord(
+        {
+          spanId: generationId,
+          traceId: uuidv4(),
+          projectId,
+          startTimeISO: new Date().toISOString(),
+          type: "GENERATION",
+          modelName,
+          input: "hello world",
+          output: "hey whassup",
+        },
+        "testfile.txt",
+      );
+
+      expect(eventRecord.model_id).toBe(tokenModelData.id);
+      expect(eventRecord.provided_usage_details).toEqual({});
+      expect(eventRecord.usage_details).toEqual({});
+      expect(eventRecord.cost_details).toEqual({});
+      expect(eventRecord.usage_pricing_tier_id).toBeNull();
+    });
+
+    it("should cost provider-reported usage on a cancelled gateway generation", async () => {
+      const eventRecord = await (mockIngestionService as any).createEventRecord(
+        {
+          spanId: generationId,
+          traceId: uuidv4(),
+          projectId,
+          startTimeISO: new Date().toISOString(),
+          type: "GENERATION",
+          modelName,
+          level: "WARNING",
+          scopeName: gatewayScope.name,
+          metadata: {
+            scope: gatewayScope,
+            "langfuse.gateway.api_key.id": "gateway-key-1",
+          },
+          ingestionApiKey: gatewayAttribution.ingestionApiKey,
+          providedUsageDetails: { input: 10, output: 5 },
+          input: "hello world",
+          output: "[]",
+        },
+        "testfile.txt",
+      );
+
+      expect(eventRecord.usage_details).toEqual({
+        input: 10,
+        output: 5,
+        total: 15,
+      });
+      expect(eventRecord.cost_details.input).toBe(0.1);
+      expect(eventRecord.cost_details.output).toBe(0.1);
+    });
+  });
+
+  it("should preserve provided costs without usage details", async () => {
+    const generationUsage1 = {
+      model: modelName,
+      input: "hello world",
+      output: "whassup",
+      usage: null,
+      costDetails: {
+        input: 1,
+        output: 2,
+      },
+    };
+
+    const events = [
+      {
+        id: uuidv4(),
+        type: "generation-create",
+        timestamp: new Date().toISOString(),
+        body: {
+          id: generationId,
+          startTime: new Date().toISOString(),
+          ...generationUsage1,
+        },
+      },
+    ];
+
+    await (mockIngestionService as any).processObservationEventList({
+      projectId,
+      entityId: generationId,
+      createdAtTimestamp: new Date(),
+      observationEventList: events,
+      attribution: sdkAttribution,
+    });
+
+    expect(mockAddToClickhouseWriter).toHaveBeenCalled();
+    const args = mockAddToClickhouseWriter.mock.calls[0];
+    const tableName = args[0];
+    const generation = args[1];
+
+    expect(tableName).toBe("observations");
+    expect(generation.type).toBe("GENERATION");
+    expect(generation.internal_model_id).toBe(tokenModelData.id);
+
+    // Provided costs are authoritative (calculateModelUsageCosts ignores computed
+    // usage once any cost point is provided)
+    expect(generation.provided_cost_details).toEqual({ input: 1, output: 2 });
+    expect(generation.cost_details).toEqual({ input: 1, output: 2, total: 3 });
+    expect(generation.total_cost).toBe(3);
+
+    // No usage was submitted, so usage details stay blank.
+    expect(generation.usage_details).toEqual({});
+    expect(generation.provided_usage_details).toEqual({});
+
+    // No pricing tier gets stamped from an empty usage vector
+    expect(generation.usage_pricing_tier_id).toBeNull();
+    expect(generation.usage_pricing_tier_name).toBeNull();
   });
 
   describe("string to number conversion in getUsageUnits", () => {
@@ -1317,7 +1143,7 @@ describe("Token Cost Calculation", () => {
         events[0],
         "testfile.txt",
       );
-      (mockIngestionService as any).writeEventRecord(eventRecord);
+      await (mockIngestionService as any).writeEventRecord(eventRecord);
 
       expect(mockAddToClickhouseWriter).toHaveBeenCalled();
       const args = mockAddToClickhouseWriter.mock.calls[0];
@@ -1354,7 +1180,7 @@ describe("Token Cost Calculation", () => {
         events[0],
         "testfile.txt",
       );
-      (mockIngestionService as any).writeEventRecord(eventRecord);
+      await (mockIngestionService as any).writeEventRecord(eventRecord);
 
       // Invalid values should be ignored
       expect(mockAddToClickhouseWriter).toHaveBeenCalled();
@@ -1377,7 +1203,7 @@ describe("Token Cost Calculation", () => {
 
     it("should warn when provided non-total buckets sum to more than the provided total", async () => {
       (IngestionService as any).lastUsageTotalMismatchLogAt = 0;
-      const warnSpy = vi.spyOn(logger, "warn");
+      const debugSpy = vi.spyOn(logger, "debug");
       const generationId = uuidv4();
 
       const eventRecord = await (mockIngestionService as any).createEventRecord(
@@ -1397,7 +1223,7 @@ describe("Token Cost Calculation", () => {
         "testfile.txt",
       );
 
-      const mismatchWarnings = warnSpy.mock.calls.filter(([message]) =>
+      const mismatchWarnings = debugSpy.mock.calls.filter(([message]) =>
         String(message).includes("exceeds provided total"),
       );
       expect(mismatchWarnings).toHaveLength(1);
@@ -1420,7 +1246,7 @@ describe("Token Cost Calculation", () => {
 
     it("should not warn when provided buckets are consistent with the provided total", async () => {
       (IngestionService as any).lastUsageTotalMismatchLogAt = 0;
-      const warnSpy = vi.spyOn(logger, "warn");
+      const debugSpy = vi.spyOn(logger, "debug");
       const generationId = uuidv4();
 
       await (mockIngestionService as any).createEventRecord(
@@ -1440,7 +1266,7 @@ describe("Token Cost Calculation", () => {
         "testfile.txt",
       );
 
-      const mismatchWarnings = warnSpy.mock.calls.filter(([message]) =>
+      const mismatchWarnings = debugSpy.mock.calls.filter(([message]) =>
         String(message).includes("exceeds provided total"),
       );
       expect(mismatchWarnings).toHaveLength(0);
@@ -1448,7 +1274,7 @@ describe("Token Cost Calculation", () => {
 
     it("should not warn when no total is provided", async () => {
       (IngestionService as any).lastUsageTotalMismatchLogAt = 0;
-      const warnSpy = vi.spyOn(logger, "warn");
+      const debugSpy = vi.spyOn(logger, "debug");
       const generationId = uuidv4();
 
       await (mockIngestionService as any).createEventRecord(
@@ -1466,7 +1292,7 @@ describe("Token Cost Calculation", () => {
         "testfile.txt",
       );
 
-      const mismatchWarnings = warnSpy.mock.calls.filter(([message]) =>
+      const mismatchWarnings = debugSpy.mock.calls.filter(([message]) =>
         String(message).includes("exceeds provided total"),
       );
       expect(mismatchWarnings).toHaveLength(0);
@@ -1474,7 +1300,7 @@ describe("Token Cost Calculation", () => {
 
     it("should warn on the direct event path even when no model is provided", async () => {
       (IngestionService as any).lastUsageTotalMismatchLogAt = 0;
-      const warnSpy = vi.spyOn(logger, "warn");
+      const debugSpy = vi.spyOn(logger, "debug");
       const generationId = uuidv4();
 
       await (mockIngestionService as any).createEventRecord(
@@ -1492,7 +1318,7 @@ describe("Token Cost Calculation", () => {
         "testfile.txt",
       );
 
-      const mismatchWarnings = warnSpy.mock.calls.filter(([message]) =>
+      const mismatchWarnings = debugSpy.mock.calls.filter(([message]) =>
         String(message).includes("exceeds provided total"),
       );
       expect(mismatchWarnings).toHaveLength(1);
@@ -1504,7 +1330,7 @@ describe("Token Cost Calculation", () => {
 
     it("should log the warning at most once per rate-limit interval", async () => {
       (IngestionService as any).lastUsageTotalMismatchLogAt = 0;
-      const warnSpy = vi.spyOn(logger, "warn");
+      const debugSpy = vi.spyOn(logger, "debug");
 
       for (const spanId of [uuidv4(), uuidv4()]) {
         await (mockIngestionService as any).createEventRecord(
@@ -1524,7 +1350,7 @@ describe("Token Cost Calculation", () => {
         );
       }
 
-      const mismatchWarnings = warnSpy.mock.calls.filter(([message]) =>
+      const mismatchWarnings = debugSpy.mock.calls.filter(([message]) =>
         String(message).includes("exceeds provided total"),
       );
       expect(mismatchWarnings).toHaveLength(1);
@@ -1532,7 +1358,7 @@ describe("Token Cost Calculation", () => {
 
     it("should warn on the legacy merge path when incoming events carry inconsistent usage", async () => {
       (IngestionService as any).lastUsageTotalMismatchLogAt = 0;
-      const warnSpy = vi.spyOn(logger, "warn");
+      const debugSpy = vi.spyOn(logger, "debug");
       const generationId = uuidv4();
 
       const events = [
@@ -1559,9 +1385,10 @@ describe("Token Cost Calculation", () => {
         entityId: generationId,
         createdAtTimestamp: new Date(),
         observationEventList: events,
+        attribution: sdkAttribution,
       });
 
-      const mismatchWarnings = warnSpy.mock.calls.filter(([message]) =>
+      const mismatchWarnings = debugSpy.mock.calls.filter(([message]) =>
         String(message).includes("exceeds provided total"),
       );
       expect(mismatchWarnings).toHaveLength(1);
@@ -1574,7 +1401,7 @@ describe("Token Cost Calculation", () => {
 
     it("should not warn on the legacy merge path when incoming events carry no usage", async () => {
       (IngestionService as any).lastUsageTotalMismatchLogAt = 0;
-      const warnSpy = vi.spyOn(logger, "warn");
+      const debugSpy = vi.spyOn(logger, "debug");
       const generationId = uuidv4();
 
       // Partial update without usage: the guard must not fire even if merged
@@ -1598,9 +1425,10 @@ describe("Token Cost Calculation", () => {
         entityId: generationId,
         createdAtTimestamp: new Date(),
         observationEventList: events,
+        attribution: sdkAttribution,
       });
 
-      const mismatchWarnings = warnSpy.mock.calls.filter(([message]) =>
+      const mismatchWarnings = debugSpy.mock.calls.filter(([message]) =>
         String(message).includes("exceeds provided total"),
       );
       expect(mismatchWarnings).toHaveLength(0);

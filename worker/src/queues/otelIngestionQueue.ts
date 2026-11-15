@@ -1,4 +1,6 @@
 import { Job, Processor } from "bullmq";
+import type { EarlyOtelBatch } from "@langfuse/native";
+import { z } from "zod";
 import {
   clickhouseClient,
   createIngestionEventSchema,
@@ -22,6 +24,7 @@ import {
   ResourceSpan,
   type IngestionAttribution,
   UNKNOWN_INGESTION_SDK_VALUE,
+  LocalCache,
 } from "@langfuse/shared/src/server";
 import {
   applyIngestionMasking,
@@ -36,21 +39,19 @@ import {
 import { IngestionService } from "../services/IngestionService";
 import { prisma } from "@langfuse/shared/src/db";
 import { ClickhouseWriter } from "../services/ClickhouseWriter";
+import { logRetryableJobFailure } from "./jobFailureLog";
+import { ForbiddenError } from "@langfuse/shared";
 import {
-  ForbiddenError,
-  convertEventRecordToObservationForEval,
-} from "@langfuse/shared";
-import {
-  fetchObservationEvalConfigs,
-  isObservationAllowedForQueuedObservationEvals,
-  scheduleObservationEvals,
-  createObservationEvalSchedulerDeps,
-} from "../features/evaluation/observationEval";
-import {
-  createDirectOtelMediaTargets,
   createLegacyOtelMediaTargets,
   processOtelEventMedia,
+  type OtelMediaPresence,
 } from "../features/otel-media/processOtelMedia";
+import { restoreInlineMedia } from "../features/otel-media/resolveExtractedMedia";
+import { processOtelEvents } from "../features/otel-ingestion/processOtelEvents";
+import {
+  parsePreparedOtelBatch,
+  prepareOtelBatch,
+} from "../features/otel-ingestion/prepareOtelBatch";
 
 /**
  * Legacy media processing follows legacy persistence, independently of
@@ -111,6 +112,222 @@ export function checkHeaderBasedDirectWrite(params: {
   }
 
   return false;
+}
+
+export type OtelWritePath =
+  | "dual"
+  | "direct_header"
+  | "direct_env"
+  | "direct_scope"
+  | "direct_org_cutoff";
+
+/**
+ * Whether a batch was exported by a Langfuse SDK rather than a plain OTel
+ * pipeline.
+ *
+ * Either signal is sufficient: the SDKs send `x-langfuse-sdk-name` (normalized
+ * to UNKNOWN_INGESTION_SDK_VALUE when absent), and their spans carry a
+ * "langfuse"-prefixed instrumentation scope. A third party that sets the
+ * header anyway is treated as SDK traffic, which is the conservative direction
+ * — it keeps the established write path.
+ */
+export function isLangfuseSdkTraffic(params: {
+  sdkName?: string;
+  scopeName?: string | null;
+}): boolean {
+  const { sdkName, scopeName } = params;
+
+  if (sdkName && sdkName !== UNKNOWN_INGESTION_SDK_VALUE) {
+    return true;
+  }
+
+  return Boolean(
+    scopeName && String(scopeName).toLowerCase().includes("langfuse"),
+  );
+}
+
+/**
+ * Whether any instrumentation scope in the batch identifies a Langfuse SDK.
+ *
+ * The scope-based version check reads only the first scope (all spans a
+ * Langfuse SDK exports share it), but the org-cutoff exclusion must be
+ * conservative: a collector-forwarded batch can mix SDK spans with third-party
+ * scopes in any order, and one Langfuse scope anywhere is enough to keep the
+ * whole batch on its established write path. Scans scope metadata only — no
+ * span bodies are touched.
+ */
+export function batchContainsLangfuseScope(
+  resourceSpans: ResourceSpan[],
+): boolean {
+  // Malformed OTLP shapes reach this code (non-array payloads, non-array
+  // scopeSpans and the like); every other resourceSpans consumer guards the
+  // same way. Guard per resource so a malformed one reads as scope-less rather
+  // than aborting the scan — it must not hide a Langfuse scope on a later
+  // resource, nor fail the batch.
+  if (!Array.isArray(resourceSpans)) {
+    return false;
+  }
+  return resourceSpans.some(
+    (resourceSpan) =>
+      Array.isArray(resourceSpan?.scopeSpans) &&
+      resourceSpan.scopeSpans.some((scopeSpan) =>
+        isLangfuseSdkTraffic({ scopeName: scopeSpan?.scope?.name ?? null }),
+      ),
+  );
+}
+
+/**
+ * Whether an organization's signup date puts it past the direct-write cutoff.
+ *
+ * Organizations created on or after the cutoff are past the point where the v4
+ * preview is force-enabled and cannot be switched off, so the events table is
+ * the only surface they read. Without `x-langfuse-ingestion-version: 4` their
+ * OTLP traffic would take the dual-write path and appear with up to ~10 minutes
+ * of delay — a broken first experience for an exporter that is otherwise set up
+ * correctly.
+ *
+ * Deliberately date-based: there is no per-organization or per-project v4
+ * column, only a per-user preview flag, so signup date is the only cohort
+ * signal available. It mirrors the UI-side rollout boundary but keys on the
+ * single organization owning the API key rather than the oldest organization a
+ * user belongs to — ingestion has no user context.
+ *
+ * The rule is Cloud-only, gated at the call site
+ * (isProjectOrgPastOtelDirectWriteCutoff): self-hosted deployments move the
+ * whole deployment at once via LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR.
+ */
+export function isOrgPastOtelDirectWriteCutoff(params: {
+  /** Organization signup date; nullish when it could not be resolved. */
+  orgCreatedAt: Date | null | undefined;
+  /** ISO date (YYYY-MM-DD), read as midnight UTC. Unset disables the rule. */
+  cutoff: string | undefined;
+}): boolean {
+  const { orgCreatedAt, cutoff } = params;
+
+  if (!cutoff || !orgCreatedAt) {
+    return false;
+  }
+
+  // An invalid date on either side compares as NaN, which is false for every
+  // comparison — unparsable input keeps the pre-cutoff behaviour by itself.
+  return orgCreatedAt.getTime() >= Date.parse(`${cutoff}T00:00:00.000Z`);
+}
+
+// An organization's signup date never changes, and the project → organization
+// mapping changes only through the rare `projects.transfer` mutation — a stale
+// entry then self-corrects within the TTL, which is acceptable for a routing
+// hint whose destinations both land the data. So the cache only needs to bound
+// memory and let deleted projects fall out. A miss costs one indexed Postgres
+// read, and only for batches that no other signal already routed (see below).
+const ORG_CREATED_AT_CACHE_TTL_MS = 60 * 60 * 1000;
+const orgCreatedAtCache = new LocalCache<{ createdAt: Date }>({
+  namespace: "otel_org_created_at",
+  enabled: true,
+  ttlMs: ORG_CREATED_AT_CACHE_TTL_MS,
+  max: 10_000,
+});
+
+/**
+ * Whether the org-created cutoff rule can apply in this deployment at all:
+ * it needs a configured date and only runs on Langfuse Cloud. Work that only
+ * feeds the rule (the batch scope scan, the signup-date lookup) is skipped
+ * while this is false — the shipped default and every self-hosted deployment.
+ */
+function isOtelDirectWriteOrgCutoffConfigured(): boolean {
+  return Boolean(
+    env.LANGFUSE_MIGRATION_V4_OTEL_DIRECT_WRITE_ORG_CREATED_CUTOFF &&
+    env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION,
+  );
+}
+
+/**
+ * Resolve whether the project's organization is past the direct-write cutoff.
+ *
+ * Keyed on project rather than the payload's optional `orgId` so replayed jobs
+ * enqueued before that field existed resolve too. Returns false when the
+ * project cannot be found, which keeps the batch on its existing path.
+ */
+async function isProjectOrgPastOtelDirectWriteCutoff(
+  projectId: string,
+): Promise<boolean> {
+  if (!isOtelDirectWriteOrgCutoffConfigured()) {
+    return false;
+  }
+  const cutoff = env.LANGFUSE_MIGRATION_V4_OTEL_DIRECT_WRITE_ORG_CREATED_CUTOFF;
+
+  try {
+    const { value } = await orgCreatedAtCache.getOrLoad(projectId, async () => {
+      const project = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: { organization: { select: { createdAt: true } } },
+      });
+
+      return {
+        value: project
+          ? { createdAt: project.organization.createdAt }
+          : undefined,
+        source: "postgres",
+      };
+    });
+
+    return isOrgPastOtelDirectWriteCutoff({
+      orgCreatedAt: value?.createdAt,
+      cutoff,
+    });
+  } catch (error) {
+    // A lookup failure must not fail the batch: fall back to the pre-cutoff
+    // path, which is still a correct destination in dual write mode.
+    logger.warn(
+      `Failed to resolve organization signup date for project ${projectId}; keeping the pre-cutoff OTel write path`,
+      error,
+    );
+    return false;
+  }
+}
+
+/**
+ * Resolve which persistence path a batch takes, and which signal decided it.
+ *
+ * Precedence is header > env > scope > org cutoff. The org cutoff sits last so
+ * the `direct_org_cutoff` label counts only the traffic that rule genuinely
+ * moves off the dual path, rather than absorbing batches that a header or a
+ * recognized SDK scope would have routed directly anyway.
+ *
+ * The org cutoff additionally excludes Langfuse SDK traffic. An older SDK has
+ * an established dual-write shape — its trace-level attributes surface on the
+ * synthetic root observation that only the dual path materializes — so flipping
+ * it would change data those users already read. A plain OTel exporter has no
+ * such prior expectation, and is the case the cutoff exists for.
+ */
+export function resolveOtelWritePath(params: {
+  headerBasedDirectWrite: boolean;
+  envForcesDirect: boolean;
+  scopeBasedDirectWrite: boolean;
+  orgCutoffForcesDirect: boolean;
+  langfuseSdkTraffic: boolean;
+}): { useDirectEventWrite: boolean; writePath: OtelWritePath } {
+  const {
+    headerBasedDirectWrite,
+    envForcesDirect,
+    scopeBasedDirectWrite,
+    orgCutoffForcesDirect,
+    langfuseSdkTraffic,
+  } = params;
+
+  if (headerBasedDirectWrite) {
+    return { useDirectEventWrite: true, writePath: "direct_header" };
+  }
+  if (envForcesDirect) {
+    return { useDirectEventWrite: true, writePath: "direct_env" };
+  }
+  if (scopeBasedDirectWrite) {
+    return { useDirectEventWrite: true, writePath: "direct_scope" };
+  }
+  if (orgCutoffForcesDirect && !langfuseSdkTraffic) {
+    return { useDirectEventWrite: true, writePath: "direct_org_cutoff" };
+  }
+
+  return { useDirectEventWrite: false, writePath: "dual" };
 }
 
 function extractBaseSdkVersion(sdkVersion: string): string {
@@ -180,7 +397,7 @@ export function checkSdkVersionRequirements(
   const { scopeName, scopeVersion, telemetrySdkLanguage } = sdkInfo;
 
   // Must be a Langfuse SDK
-  if (!scopeName || !String(scopeName).toLowerCase().includes("langfuse")) {
+  if (!isLangfuseSdkTraffic({ scopeName })) {
     return false;
   }
 
@@ -226,6 +443,12 @@ export const otelIngestionQueueProcessorBuilder = (
   return async (
     job: Job<TQueueJobTypes[QueueName.OtelIngestionQueue]>,
   ): Promise<void> => {
+    let earlyBatch: EarlyOtelBatch | undefined;
+    let mediaPath: "early" | "reference" | undefined;
+    let mediaPresence: OtelMediaPresence | undefined;
+    let inputByteLength: number | undefined;
+    let inputPreparationDurationMs: number | undefined;
+    const span = getCurrentSpan();
     try {
       const projectId = job.data.payload.authCheck.scope.projectId;
       const publicKey = job.data.payload.data.publicKey ?? "";
@@ -240,7 +463,6 @@ export const otelIngestionQueueProcessorBuilder = (
           job.data.payload.sdkVersion || UNKNOWN_INGESTION_SDK_VALUE,
       };
 
-      const span = getCurrentSpan();
       if (span) {
         span.setAttribute("messaging.bullmq.job.input.id", job.data.id);
         span.setAttribute(
@@ -281,47 +503,98 @@ export const otelIngestionQueueProcessorBuilder = (
       // Otherwise, we'd probably have to upsert one row per generated event further below.
       // Easy change, but needs alignment.
 
-      // Download file from blob storage
-      const resourceSpans = await getS3EventStorageClient(
+      const earlyMediaEnabled =
+        env.LANGFUSE_OTEL_EARLY_MEDIA_EXTRACTION_ENABLED === "true" &&
+        (env.LANGFUSE_OTEL_EARLY_MEDIA_EXTRACTION_PROJECT_IDS.includes("*") ||
+          env.LANGFUSE_OTEL_EARLY_MEDIA_EXTRACTION_PROJECT_IDS.includes(
+            projectId,
+          ));
+      mediaPath = earlyMediaEnabled ? "early" : "reference";
+      span?.setAttribute("langfuse.ingestion.otel.media_path", mediaPath);
+      // Count selection once per queue attempt, including jobs that later fail.
+      recordIncrement("langfuse.ingestion.otel.media_path", 1, {
+        path: mediaPath,
+      });
+
+      const eventStorage = getS3EventStorageClient(
         env.LANGFUSE_S3_EVENT_UPLOAD_BUCKET,
-      ).download(fileKey);
-
-      recordHistogram(
-        "langfuse.ingestion.s3_file_size_bytes",
-        resourceSpans.length, // At this point it's still a string.
-        {
-          skippedS3List: "true",
-          otel: "true",
-        },
       );
-
-      // Parse spans from S3 download
-      let parsedSpans = JSON.parse(resourceSpans);
-
-      // Apply ingestion masking if enabled (EE feature)
-      if (isIngestionMaskingEnabled()) {
-        const maskingResult = await applyIngestionMasking({
-          data: parsedSpans,
+      let parsedSpans: ResourceSpan[];
+      if (earlyMediaEnabled) {
+        const bytes = await eventStorage.downloadBytes(fileKey);
+        const preparationStartedAt = performance.now();
+        inputByteLength = bytes.byteLength;
+        recordHistogram(
+          "langfuse.ingestion.s3_file_size_bytes",
+          inputByteLength,
+          { skippedS3List: "true", otel: "true" },
+        );
+        const prepared = await prepareOtelBatch({
+          bytes: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
           projectId,
           orgId: job.data.payload.authCheck.scope.orgId,
           propagatedHeaders: job.data.payload.propagatedHeaders,
+          extractMedia:
+            env.LANGFUSE_OTEL_MEDIA_UPLOAD_ENABLED === "true" &&
+            Boolean(env.LANGFUSE_S3_MEDIA_UPLOAD_BUCKET),
         });
-
-        if (!maskingResult.success) {
-          // Fail-closed: drop event. Emit the S3 location so operators can
-          // scan logs to identify which raw payloads need to be replayed via
-          // worker/src/scripts/replayIngestionEventsV2 once the upstream
-          // masking callback is healthy again.
-          logger.warn(`Dropping OTEL event due to masking failure`, {
+        if ("error" in prepared) {
+          logger.warn("Dropping OTEL event due to masking failure", {
             projectId,
             orgId: job.data.payload.authCheck.scope.orgId,
             fileKey,
-            error: maskingResult.error,
+            error: prepared.error,
             propagatedHeaders: job.data.payload.propagatedHeaders,
           });
           return;
         }
-        parsedSpans = maskingResult.data;
+        ({ batch: earlyBatch, resourceSpans: parsedSpans } =
+          await parsePreparedOtelBatch(prepared, bytes));
+        inputPreparationDurationMs = performance.now() - preparationStartedAt;
+      } else {
+        // Download file from blob storage
+        const resourceSpans = await eventStorage.download(fileKey);
+        const preparationStartedAt = performance.now();
+        inputByteLength = Buffer.byteLength(resourceSpans, "utf8");
+
+        recordHistogram(
+          "langfuse.ingestion.s3_file_size_bytes",
+          inputByteLength,
+          {
+            skippedS3List: "true",
+            otel: "true",
+          },
+        );
+
+        // Parse spans from S3 download
+        parsedSpans = JSON.parse(resourceSpans);
+
+        // Apply ingestion masking if enabled (EE feature)
+        if (isIngestionMaskingEnabled()) {
+          const maskingResult = await applyIngestionMasking({
+            data: parsedSpans,
+            projectId,
+            orgId: job.data.payload.authCheck.scope.orgId,
+            propagatedHeaders: job.data.payload.propagatedHeaders,
+          });
+
+          if (!maskingResult.success) {
+            // Fail-closed: drop event. Emit the S3 location so operators can
+            // scan logs to identify which raw payloads need to be replayed via
+            // worker/src/scripts/replayIngestionEventsV2 once the upstream
+            // masking callback is healthy again.
+            logger.warn(`Dropping OTEL event due to masking failure`, {
+              projectId,
+              orgId: job.data.payload.authCheck.scope.orgId,
+              fileKey,
+              error: maskingResult.error,
+              propagatedHeaders: job.data.payload.propagatedHeaders,
+            });
+            return;
+          }
+          parsedSpans = maskingResult.data;
+        }
+        inputPreparationDurationMs = performance.now() - preparationStartedAt;
       }
 
       // Generate events via OtelIngestionProcessor
@@ -331,9 +604,17 @@ export const otelIngestionQueueProcessorBuilder = (
         sdkName: attribution.ingestionSdkName,
         sdkVersion: attribution.ingestionSdkVersion,
         fileKey,
+        isLangfuseInternal,
       });
       const events: IngestionEventType[] =
         await processor.processToIngestionEvents(parsedSpans);
+      const writesToLegacyTables = v4WritesToLegacyTables(env);
+      if (earlyBatch && writesToLegacyTables) {
+        await restoreInlineMedia(
+          earlyBatch,
+          events.map((event) => event.body),
+        );
+      }
 
       // Here, we split the events into observations and non-observations.
       // Observations go into the IngestionService directly whereas the non-observations make another run through the processEventBatch method.
@@ -342,22 +623,41 @@ export const otelIngestionQueueProcessorBuilder = (
       );
       // We need to parse each incoming observation through our ingestion schema to make use of its included transformations.
       const ingestionSchema = createIngestionEventSchema(isLangfuseInternal);
-      const observations = events
-        .filter((e) => getClickhouseEntityType(e.type) === "observation")
+      const candidateObservations = events.filter(
+        (e) => getClickhouseEntityType(e.type) === "observation",
+      );
+      let firstParseError: z.ZodError | undefined;
+      const observations = candidateObservations
         .map((o) => ingestionSchema.safeParse(o))
         .flatMap((o) => {
           if (!o.success) {
-            logger.warn(
-              `Failed to parse otel observation for project ${projectId} in ${fileKey}: ${o.error}`,
-              {
-                error: o.error,
-                fileKey,
-              },
-            );
+            if (firstParseError === undefined) {
+              firstParseError = o.error;
+            }
             return [];
           }
           return [o.data];
         });
+
+      // Per-observation parse failures are near-pure noise (customer-sent data
+      // that fails our schema). Aggregate to one metric + one sample warn per
+      // file instead of one line per observation.
+      const parseFailureCount =
+        candidateObservations.length - observations.length;
+      if (parseFailureCount > 0) {
+        recordIncrement(
+          "langfuse.ingestion.otel.observation_parse_failure",
+          parseFailureCount,
+        );
+        logger.warn(
+          `Failed to parse ${parseFailureCount}/${candidateObservations.length} otel observations for project ${projectId} in ${fileKey}: ${firstParseError}`,
+          {
+            error: firstParseError,
+            fileKey,
+            parseFailureCount,
+          },
+        );
+      }
 
       // In the next row, we only consider observations. The traces will be recorded in processEventBatch.
       recordIncrement("langfuse.ingestion.event", observations.length, {
@@ -396,6 +696,9 @@ export const otelIngestionQueueProcessorBuilder = (
       //
       // Priority 2 (fallback): Per-span OTEL scope inspection (legacy).
       //   - scope.name contains "langfuse", sdk-experiment environment, Python >= 3.9.0 or JS >= 4.4.0
+      //
+      // Priority 3 (last resort): the owning organization signed up past the
+      //   Cloud direct-write cutoff. Non-Langfuse-SDK exports only (see below).
       const headerBasedDirectWrite = checkHeaderBasedDirectWrite({
         sdkName: job.data.payload.sdkName,
         sdkVersion: job.data.payload.sdkVersion,
@@ -406,9 +709,16 @@ export const otelIngestionQueueProcessorBuilder = (
       //   LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR=direct forces every batch
       //   onto the direct events_full path regardless of SDK headers/scopes.
       const envForcesDirect = v4ForceDirectOtelWrite(env);
-      let useDirectEventWrite = envForcesDirect || headerBasedDirectWrite;
 
-      if (!useDirectEventWrite) {
+      // Evaluated whenever the higher-precedence header/env signals did not
+      // already qualify, so the write_path label can attribute the decision
+      // exactly and `direct_org_cutoff` counts only the traffic that rule
+      // genuinely moves off the dual path.
+      let scopeBasedDirectWrite = false;
+      let langfuseSdkTraffic = isLangfuseSdkTraffic({
+        sdkName: job.data.payload.sdkName,
+      });
+      if (!envForcesDirect && !headerBasedDirectWrite) {
         const hasExperimentEnvironment = observations.some((o) => {
           const body = o.body as { environment?: string };
           return body.environment === "sdk-experiment";
@@ -421,22 +731,41 @@ export const otelIngestionQueueProcessorBuilder = (
                 scopeVersion: null,
                 telemetrySdkLanguage: null,
               };
-        useDirectEventWrite = checkSdkVersionRequirements(
+        scopeBasedDirectWrite = checkSdkVersionRequirements(
           sdkInfo,
           hasExperimentEnvironment,
         );
+        // An older SDK that predates the header still identifies itself through
+        // its instrumentation scope, so both signals have to be consulted
+        // before the org cutoff may flip a batch. Checked across every scope in
+        // the batch, not just the first — collector-forwarded batches can mix
+        // SDK spans with third-party scopes in any order. The scan only feeds
+        // the cutoff rule, so it is skipped while that rule cannot apply.
+        langfuseSdkTraffic =
+          langfuseSdkTraffic ||
+          (isOtelDirectWriteOrgCutoffConfigured() &&
+            batchContainsLangfuseScope(parsedSpans));
       }
 
-      let writePath: "dual" | "direct_header" | "direct_env" | "direct_scope";
-      if (!useDirectEventWrite) {
-        writePath = "dual";
-      } else if (headerBasedDirectWrite) {
-        writePath = "direct_header";
-      } else if (envForcesDirect) {
-        writePath = "direct_env";
-      } else {
-        writePath = "direct_scope";
-      }
+      // Resolved only when it can still change the outcome — every
+      // higher-precedence signal has declined and this is not SDK traffic — so
+      // the Postgres lookup stays off the path for batches already routed by a
+      // header. resolveOtelWritePath remains authoritative for the rule; this
+      // guard is purely an optimization.
+      const orgCutoffForcesDirect =
+        !headerBasedDirectWrite &&
+        !envForcesDirect &&
+        !scopeBasedDirectWrite &&
+        !langfuseSdkTraffic &&
+        (await isProjectOrgPastOtelDirectWriteCutoff(projectId));
+
+      const { useDirectEventWrite, writePath } = resolveOtelWritePath({
+        headerBasedDirectWrite,
+        envForcesDirect,
+        scopeBasedDirectWrite,
+        orgCutoffForcesDirect,
+        langfuseSdkTraffic,
+      });
 
       span?.setAttribute("langfuse.ingestion.otel.write_path", writePath);
       recordIncrement("langfuse.ingestion.otel.write_path", 1, {
@@ -448,7 +777,6 @@ export const otelIngestionQueueProcessorBuilder = (
       // validation already guarantees useDirectEventWrite is true here, so
       // observations and traces don't need the mergeAndWrite / IngestionQueue
       // detour that would otherwise populate the legacy tables.
-      const writesToLegacyTables = v4WritesToLegacyTables(env);
       const skipLegacyWrites = !writesToLegacyTables;
       const shouldProcessLegacyMedia = shouldProcessLegacyOtelMedia({
         mediaUploadEnabled: env.LANGFUSE_OTEL_MEDIA_UPLOAD_ENABLED === "true",
@@ -469,14 +797,23 @@ export const otelIngestionQueueProcessorBuilder = (
           // Process the exact normalized representation written by the legacy
           // path. Targets retain body references, so replacements also reach
           // events-table forwarding when that destination is enabled.
-          await processOtelEventMedia({
+          const legacyMediaPresence = await processOtelEventMedia({
             targets: createLegacyOtelMediaTargets(traces.concat(observations)),
             writePath: "legacy",
+            earlyBatch,
+            mediaPath,
+            inputByteLength,
             projectId,
             fileKey,
             mediaBucket: env.LANGFUSE_S3_MEDIA_UPLOAD_BUCKET,
             mediaPrefix: env.LANGFUSE_S3_MEDIA_UPLOAD_PREFIX,
           });
+          if (legacyMediaPresence) {
+            mediaPresence = combineOtelMediaPresence(
+              mediaPresence,
+              legacyMediaPresence,
+            );
+          }
         }
 
         // Running everything concurrently might be detrimental to the event loop, but has probably
@@ -511,120 +848,26 @@ export const otelIngestionQueueProcessorBuilder = (
         ]);
       }
 
-      // Process events for observation evals and direct event writes
-      // This phase handles two independent concerns:
-      // 1. Scheduling observation-level evals (if eval configs exist)
-      // 2. Writing directly to events table (if SDK version requirements are met)
-      //
-      // Both require enriched event records with trace-level attributes
-      // (userId, sessionId, tags, release) that processToEvent provides.
-      const eventInputs = processor.processToEvent(parsedSpans);
-
-      if (eventInputs.length === 0) {
-        return;
-      }
-
       // Determine what processing is needed
       const shouldWriteToEventsTable =
         v4WritesToEventsTable(env) && useDirectEventWrite;
-
-      const evalConfigs = await fetchObservationEvalConfigs(projectId).catch(
-        (error) => {
-          traceException(error);
-          logger.warn(
-            `Failed to fetch observation eval configs for project ${projectId}`,
-            error,
-          );
-
-          return [];
-        },
-      );
-      const hasEvalConfigs = evalConfigs.length > 0;
-
-      // Early exit if no processing needed
-      if (!hasEvalConfigs && !shouldWriteToEventsTable) {
-        return;
+      const directMediaPresence = await processOtelEvents({
+        processor,
+        resourceSpans: parsedSpans,
+        ingestionService,
+        projectId,
+        fileKey,
+        shouldWriteToEventsTable,
+        earlyBatch,
+        mediaPath,
+        inputByteLength,
+      });
+      if (directMediaPresence) {
+        mediaPresence = combineOtelMediaPresence(
+          mediaPresence,
+          directMediaPresence,
+        );
       }
-
-      if (
-        env.LANGFUSE_OTEL_MEDIA_UPLOAD_ENABLED === "true" &&
-        shouldWriteToEventsTable
-      ) {
-        await processOtelEventMedia({
-          targets: createDirectOtelMediaTargets(eventInputs),
-          writePath: "direct",
-          projectId,
-          fileKey,
-          mediaBucket: env.LANGFUSE_S3_MEDIA_UPLOAD_BUCKET,
-          mediaPrefix: env.LANGFUSE_S3_MEDIA_UPLOAD_PREFIX,
-        });
-      }
-
-      // Create scheduler deps only if we have eval configs
-      const evalSchedulerDeps = hasEvalConfigs
-        ? createObservationEvalSchedulerDeps()
-        : null;
-
-      await Promise.all(
-        // Process each event independently
-        eventInputs.map(async (eventInput) => {
-          // Step 1: Create enriched event record (required for both evals and writes)
-          let eventRecord;
-          try {
-            eventRecord = await ingestionService.createEventRecord(
-              eventInput,
-              fileKey,
-            );
-          } catch (error) {
-            traceException(error);
-            logger.error(
-              `Failed to create event record for project ${eventInput.projectId} and observation ${eventInput.spanId}`,
-              { error, fileKey },
-            );
-
-            return;
-          }
-
-          // Step 2: Schedule observation evals (independent of event writes).
-          // Internal langfuse-* environments are excluded to prevent
-          // eval-on-eval recursion, except experiment run-item roots; see
-          // isObservationAllowedForQueuedObservationEvals.
-          if (hasEvalConfigs && evalSchedulerDeps) {
-            try {
-              const observation =
-                convertEventRecordToObservationForEval(eventRecord);
-
-              if (isObservationAllowedForQueuedObservationEvals(observation)) {
-                await scheduleObservationEvals({
-                  observation,
-                  configs: evalConfigs,
-                  schedulerDeps: evalSchedulerDeps,
-                });
-              }
-            } catch (error) {
-              traceException(error);
-
-              logger.error(
-                `Failed to schedule observation evals for project ${eventInput.projectId} and observation ${eventInput.spanId}`,
-                { error, fileKey },
-              );
-            }
-          }
-
-          // Step 3: Write to events table (independent of eval scheduling)
-          if (shouldWriteToEventsTable) {
-            try {
-              ingestionService.writeEventRecord(eventRecord);
-            } catch (error) {
-              traceException(error);
-              logger.error(
-                `Failed to write event record for ${eventInput.spanId}`,
-                { error, fileKey },
-              );
-            }
-          }
-        }),
-      );
     } catch (e) {
       const fileKey = job.data.payload.data.fileKey;
       if (e instanceof ForbiddenError) {
@@ -641,12 +884,97 @@ export const otelIngestionQueueProcessorBuilder = (
         reason: "processing_error",
       });
 
-      logger.error(
-        `Failed job otel ingestion processing for ${job.data.payload.authCheck.scope.projectId}`,
-        { error: e, fileKey },
-      );
-      traceException(e);
+      logRetryableJobFailure({
+        message: `Failed job otel ingestion processing for ${job.data.payload.authCheck.scope.projectId}`,
+        error: e,
+        job,
+        fields: { fileKey },
+      });
       throw e;
+    } finally {
+      await earlyBatch?.dispose();
+      setOtelInputPreparationSpanAttributes(span, {
+        durationMs: inputPreparationDurationMs,
+        mediaPath,
+        mediaPresence,
+      });
+      recordOtelInputPreparationMetrics({
+        durationMs: inputPreparationDurationMs,
+        mediaPath,
+        mediaPresence,
+        inputByteLength,
+      });
     }
   };
 };
+
+function combineOtelMediaPresence(
+  current: OtelMediaPresence | undefined,
+  next: OtelMediaPresence,
+): OtelMediaPresence {
+  if (current === "present" || next === "present") return "present";
+  if (current === "unknown" || next === "unknown") return "unknown";
+  return "absent";
+}
+
+function setOtelInputPreparationSpanAttributes(
+  span: ReturnType<typeof getCurrentSpan>,
+  params: {
+    durationMs?: number;
+    mediaPath?: "early" | "reference";
+    mediaPresence?: OtelMediaPresence;
+  },
+): void {
+  if (params.mediaPath) {
+    span?.setAttribute(
+      "langfuse.ingestion.otel.media_presence",
+      params.mediaPresence ?? "unknown",
+    );
+    if (params.mediaPresence && params.mediaPresence !== "unknown") {
+      span?.setAttribute(
+        "langfuse.ingestion.otel.media_detected",
+        params.mediaPresence === "present",
+      );
+    }
+  }
+  if (params.durationMs !== undefined) {
+    span?.setAttribute(
+      "langfuse.ingestion.otel.input_preparation_duration_ms",
+      params.durationMs,
+    );
+  }
+}
+
+function recordOtelInputPreparationMetrics(params: {
+  durationMs?: number;
+  mediaPath?: "early" | "reference";
+  mediaPresence?: OtelMediaPresence;
+  inputByteLength?: number;
+}): void {
+  if (params.durationMs === undefined || !params.mediaPath) return;
+
+  // The duration is captured after download and before event conversion.
+  // Media classification comes from the existing downstream detector.
+  const tags = {
+    media_path: params.mediaPath,
+    media_presence: params.mediaPresence ?? "unknown",
+  };
+  recordDistribution(
+    "langfuse.ingestion.otel.input_preparation_duration_ms",
+    params.durationMs,
+    tags,
+  );
+  recordIncrement("langfuse.ingestion.otel.input_preparation_sample", 1, tags);
+  recordIncrement(
+    "langfuse.ingestion.otel.input_preparation_duration_total_ms",
+    params.durationMs,
+    tags,
+  );
+  if (params.inputByteLength && params.inputByteLength > 0) {
+    recordIncrement(
+      "langfuse.ingestion.otel.input_preparation_bytes_total",
+      params.inputByteLength,
+      tags,
+    );
+  }
+}

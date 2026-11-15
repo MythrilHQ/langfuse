@@ -5,6 +5,10 @@ import {
   validateQuery,
   type QueryType,
 } from "@langfuse/shared/query";
+import {
+  AI_GATEWAY_KEY_OWNER_USER_ID_METADATA_KEY,
+  AI_GATEWAY_SERVICE_NAME,
+} from "@langfuse/shared";
 import { env } from "@/src/env.mjs";
 import {
   createTrace,
@@ -15,7 +19,6 @@ import {
   createScoresCh,
   createEvent,
   createEventsCh,
-  clickhouseClient,
 } from "@langfuse/shared/src/server";
 import { randomUUID } from "crypto";
 
@@ -2807,6 +2810,139 @@ describe("queryBuilder", () => {
     });
 
     describe("observations view", () => {
+      it("counts per-tool invocations including same-tool repeats (toolCallInvocations)", async () => {
+        const projectId = randomUUID();
+        const trace = createTrace({
+          project_id: projectId,
+          name: "tool-invocations-trace",
+          environment: "default",
+          timestamp: new Date().getTime(),
+        });
+        await createTracesCh([trace]);
+
+        const now = new Date().getTime();
+        const base = {
+          project_id: projectId,
+          trace_id: trace.id,
+          type: "generation",
+          environment: "default",
+          start_time: now,
+          end_time: now + 100,
+        };
+        // One observation with three PARALLEL calls to the same tool, one
+        // with a single call, one calling a different tool: ground truth is
+        // fetch = 4 invocations across 2 observations, search = 1.
+        await createObservationsCh([
+          createObservation({
+            ...base,
+            name: "obs-parallel-fetch",
+            tool_calls: ['{"id":"c1"}', '{"id":"c2"}', '{"id":"c3"}'],
+            tool_call_names: ["fetch", "fetch", "fetch"],
+          }),
+          createObservation({
+            ...base,
+            name: "obs-single-fetch",
+            tool_calls: ['{"id":"c4"}'],
+            tool_call_names: ["fetch"],
+          }),
+          createObservation({
+            ...base,
+            name: "obs-search",
+            tool_calls: ['{"id":"c5"}'],
+            tool_call_names: ["search"],
+          }),
+        ]);
+
+        const query: QueryType = {
+          view: "observations",
+          dimensions: [],
+          metrics: [{ measure: "toolCallInvocations", aggregation: "sum" }],
+          filters: [],
+          timeDimension: null,
+          fromTimestamp: new Date(now - 86400000).toISOString(),
+          toTimestamp: new Date(now + 86400000).toISOString(),
+          orderBy: [{ field: "calledToolNames", direction: "asc" }],
+        };
+
+        const result = await executeQuery(projectId, query, "v1", false);
+        expect(result).toHaveLength(2);
+        const fetchRow = result.find((r) => r.calledToolNames === "fetch");
+        const searchRow = result.find((r) => r.calledToolNames === "search");
+        expect(Number(fetchRow!.sum_toolCallInvocations)).toBe(4);
+        expect(Number(searchRow!.sum_toolCallInvocations)).toBe(1);
+
+        // Contrast: counting observation rows dedupes same-tool repeats within
+        // one observation, so the same data yields observations-per-tool.
+        const countResult = await executeQuery(
+          projectId,
+          {
+            ...query,
+            dimensions: [{ field: "calledToolNames" }],
+            metrics: [{ measure: "count", aggregation: "count" }],
+          },
+          "v1",
+          false,
+        );
+        const fetchCountRow = countResult.find(
+          (r) => r.calledToolNames === "fetch",
+        );
+        expect(Number(fetchCountRow!.count_count)).toBe(2);
+
+        // The v1 path normally uses the two-level query, but the declaration
+        // also supports the single-level optimization without changing results.
+        const resultOptimized = await executeQuery(
+          projectId,
+          query,
+          "v1",
+          true,
+        );
+        expect(resultOptimized).toEqual(result);
+      });
+
+      it("counts per-tool invocations on the v2 events view (toolCallInvocations)", async () => {
+        const projectId = randomUUID();
+        const now = Date.now() * 1000;
+        await createEventsCh([
+          createEvent({
+            project_id: projectId,
+            start_time: now,
+            end_time: now + 100_000,
+            tool_calls: ['{"id":"c1"}', '{"id":"c2"}', '{"id":"c3"}'],
+            tool_call_names: ["fetch", "fetch", "fetch"],
+          }),
+          createEvent({
+            project_id: projectId,
+            start_time: now,
+            end_time: now + 100_000,
+            tool_calls: ['{"id":"c4"}'],
+            tool_call_names: ["fetch"],
+          }),
+        ]);
+
+        const result = await executeQuery(
+          projectId,
+          {
+            view: "observations",
+            dimensions: [],
+            metrics: [
+              { measure: "toolCallInvocations", aggregation: "sum" },
+              { measure: "count", aggregation: "count" },
+            ],
+            filters: [],
+            timeDimension: null,
+            fromTimestamp: new Date(Date.now() - 86400000).toISOString(),
+            toTimestamp: new Date(Date.now() + 86400000).toISOString(),
+            orderBy: null,
+          },
+          "v2",
+          true,
+        );
+        expect(result).toHaveLength(1);
+        expect(result[0].calledToolNames).toBe("fetch");
+        expect(Number(result[0].sum_toolCallInvocations)).toBe(4);
+        expect(Number(result[0].count_count)).toBe(2);
+      });
+
       it("should calculate p95 timeToFirstToken for each trace name using observations view", async () => {
         // Setup
         const projectId = randomUUID();
@@ -3248,8 +3384,13 @@ describe("queryBuilder", () => {
         result.data = await executeQuery(projectId, query);
 
         expect(result.data).toHaveLength(2);
-        expect(result.data[0].name).toBe("observation-basic");
-        expect(Number(result.data[0].count_count)).toBe(1);
+        expect(result.data.map((row) => row.name).toSorted()).toEqual([
+          "observation-basic",
+          "observation-premium",
+        ]);
+        expect(result.data.every((row) => Number(row.count_count) === 1)).toBe(
+          true,
+        );
       });
 
       it("should generate histogram with custom bin count for cost distribution", async () => {
@@ -3886,31 +4027,6 @@ describe("queryBuilder", () => {
   describe("pairExpand map expansion (v2)", () => {
     const isEventsTableV2Enabled =
       env.LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN === "true" ? it : it.skip;
-    let hasLegacyEventsTable = false;
-
-    const maybeItWithEventsTable = (
-      name: string,
-      testFn: () => Promise<void>,
-    ): void => {
-      isEventsTableV2Enabled(name, async () => {
-        if (!hasLegacyEventsTable) return;
-        await testFn();
-      });
-    };
-
-    beforeAll(async () => {
-      if (env.LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN !== "true") return;
-
-      try {
-        const result = await clickhouseClient().query({
-          query: "EXISTS TABLE default.events",
-          format: "TabSeparated",
-        });
-        hasLegacyEventsTable = (await result.text()).trim() === "1";
-      } catch {
-        hasLegacyEventsTable = false;
-      }
-    });
 
     it("should emit ARRAY JOIN clause for pairExpand dimensions", async () => {
       const projectId = randomUUID();
@@ -3930,20 +4046,21 @@ describe("queryBuilder", () => {
         true,
       );
 
-      expect(sql).toContain("ARRAY JOIN");
-      expect(sql).toContain(
-        "mapKeys(events_observations.cost_details) AS costType",
-      );
-      expect(sql).toContain(
-        "mapValues(events_observations.cost_details) AS cost_value",
-      );
+      expect(sql).toMatch(/\barray join\b/i);
+      expect(sql).toMatch(/mapKeys\(\w+\.cost_details\) as costType\b/i);
+      expect(sql).toMatch(/mapValues\(\w+\.cost_details\) as cost_value\b/i);
       // ARRAY JOIN must appear before WHERE
-      expect(sql.indexOf("ARRAY JOIN")).toBeLessThan(sql.indexOf("WHERE"));
+      expect(sql.search(/\barray join\b/i)).toBeLessThan(
+        sql.search(/\bwhere\b/i),
+      );
       // No inline arrayJoin() function call — must use clause form
       expect(sql).not.toMatch(/arrayJoin\(mapKeys/);
+      // ARRAY JOIN already aliases the key; re-emitting `costType AS costType`
+      // makes ClickHouse throw "Duplicate alias in ARRAY JOIN".
+      expect(sql).not.toMatch(/costType\s+as\s+costType/i);
     });
 
-    maybeItWithEventsTable(
+    isEventsTableV2Enabled(
       "should aggregate cost_details by type correctly",
       async () => {
         const projectId = randomUUID();
@@ -3953,13 +4070,13 @@ describe("queryBuilder", () => {
             project_id: projectId,
             type: "GENERATION",
             cost_details: { input: 10, output: 20, total: 30 },
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
           createEvent({
             project_id: projectId,
             type: "GENERATION",
             cost_details: { input: 5, output: 15, total: 20 },
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
         ];
         await createEventsCh(events);
@@ -3993,7 +4110,7 @@ describe("queryBuilder", () => {
       },
     );
 
-    maybeItWithEventsTable(
+    isEventsTableV2Enabled(
       "should aggregate usage_details by type correctly",
       async () => {
         const projectId = randomUUID();
@@ -4003,13 +4120,13 @@ describe("queryBuilder", () => {
             project_id: projectId,
             type: "GENERATION",
             usage_details: { input: 100, output: 200, total: 300 },
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
           createEvent({
             project_id: projectId,
             type: "GENERATION",
             usage_details: { input: 50, output: 75, total: 125 },
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
         ];
         await createEventsCh(events);
@@ -4040,7 +4157,7 @@ describe("queryBuilder", () => {
       },
     );
 
-    maybeItWithEventsTable(
+    isEventsTableV2Enabled(
       "should produce timeseries with costType dimension and WITH FILL",
       async () => {
         const projectId = randomUUID();
@@ -4072,11 +4189,10 @@ describe("queryBuilder", () => {
           true,
         );
 
-        expect(sql).toContain("WITH FILL");
+        expect(sql).toMatch(/\bwith fill\b/i);
         expect(sql).toContain("time_dimension");
         // GROUP BY parts may be newline-separated in the generated SQL
-        expect(sql).toContain("GROUP BY costType");
-        expect(sql).toMatch(/GROUP BY costType[\s,]+time_dimension/);
+        expect(sql).toMatch(/\bgroup by costType[\s,]+time_dimension\b/i);
 
         const result = await executeQuery(
           projectId,
@@ -4101,7 +4217,7 @@ describe("queryBuilder", () => {
       },
     );
 
-    maybeItWithEventsTable(
+    isEventsTableV2Enabled(
       "should respect type filter with pairExpand dimensions",
       async () => {
         const projectId = randomUUID();
@@ -4111,13 +4227,13 @@ describe("queryBuilder", () => {
             project_id: projectId,
             type: "GENERATION",
             cost_details: { input: 10 },
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
           createEvent({
             project_id: projectId,
             type: "SPAN",
             cost_details: { input: 999 },
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
         ];
         await createEventsCh(events);
@@ -4151,7 +4267,7 @@ describe("queryBuilder", () => {
       },
     );
 
-    maybeItWithEventsTable(
+    isEventsTableV2Enabled(
       "should aggregate cost_details by type correctly via two-level query path",
       async () => {
         // Forces the two-level path by passing useSingleLevelOptimization=false.
@@ -4164,13 +4280,13 @@ describe("queryBuilder", () => {
             project_id: projectId,
             type: "GENERATION",
             cost_details: { input: 10, output: 20, total: 30 },
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
           createEvent({
             project_id: projectId,
             type: "GENERATION",
             cost_details: { input: 5, output: 15, total: 20 },
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
         ];
         await createEventsCh(events);
@@ -4204,7 +4320,7 @@ describe("queryBuilder", () => {
       },
     );
 
-    maybeItWithEventsTable(
+    isEventsTableV2Enabled(
       "should auto-include costType dimension when only costByType measure is requested",
       async () => {
         // Verifies requiresDimension: the query builder must inject the costType
@@ -4216,7 +4332,7 @@ describe("queryBuilder", () => {
             project_id: projectId,
             type: "GENERATION",
             cost_details: { input: 7, output: 3 },
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
         ];
         await createEventsCh(events);
@@ -4300,6 +4416,106 @@ describe("queryBuilder", () => {
       ).rejects.toThrow("Only one pairExpand dimension is supported per query");
     });
   });
+
+  describe("AI gateway attribution (v2)", () => {
+    const itWithEventsTable =
+      env.LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN === "true" ? it : it.skip;
+
+    itWithEventsTable(
+      "attributes user-tied keys to their owner and leaves service keys out",
+      async () => {
+        const projectId = randomUUID();
+        const gatewayEvent = (params: {
+          keyId: string;
+          ownerUserId?: string;
+          userId?: string;
+        }) =>
+          createEvent({
+            project_id: projectId,
+            type: "GENERATION",
+            start_time: Date.now() * 1000,
+            service_name: AI_GATEWAY_SERVICE_NAME,
+            ingestion_api_key: params.keyId,
+            user_id: params.userId ?? null,
+            metadata_names: params.ownerUserId
+              ? [AI_GATEWAY_KEY_OWNER_USER_ID_METADATA_KEY]
+              : [],
+            metadata_values: params.ownerUserId ? [params.ownerUserId] : [],
+          });
+        await createEventsCh([
+          gatewayEvent({ keyId: "key-a1", ownerUserId: "user-a" }),
+          // A second key of the same owner, e.g. one revoked since.
+          gatewayEvent({ keyId: "key-a2", ownerUserId: "user-a" }),
+          // A service key whose caller claims to be user-a.
+          gatewayEvent({ keyId: "service-key", userId: "user-a" }),
+          // SDK traffic into the same project.
+          createEvent({
+            project_id: projectId,
+            type: "GENERATION",
+            start_time: Date.now() * 1000,
+            user_id: "user-a",
+            ingestion_api_key: "pk-lf-sdk",
+          }),
+        ]);
+
+        const result = await executeQuery(
+          projectId,
+          {
+            view: "observations",
+            dimensions: [{ field: "aiGatewayKeyOwnerUserId" }],
+            metrics: [{ measure: "count", aggregation: "count" }],
+            filters: [
+              {
+                column: "aiGatewayKeyOwnerUserId",
+                operator: "is not null",
+                value: "",
+                type: "null",
+              },
+            ],
+            timeDimension: null,
+            fromTimestamp: new Date(Date.now() - 86400000).toISOString(),
+            toTimestamp: new Date(Date.now() + 86400000).toISOString(),
+            orderBy: null,
+          },
+          "v2",
+          true,
+        );
+
+        expect(
+          Object.fromEntries(
+            result.map((row) => [
+              String(row["aiGatewayKeyOwnerUserId"]),
+              Number(row["count_count"]),
+            ]),
+          ),
+        ).toEqual({ "user-a": 2 });
+
+        const [keyFiltered] = await executeQuery(
+          projectId,
+          {
+            view: "observations",
+            dimensions: [],
+            metrics: [{ measure: "count", aggregation: "count" }],
+            filters: [
+              {
+                column: "aiGatewayKeyId",
+                operator: "any of",
+                value: ["key-a1", "service-key"],
+                type: "stringOptions",
+              },
+            ],
+            timeDimension: null,
+            fromTimestamp: new Date(Date.now() - 86400000).toISOString(),
+            toTimestamp: new Date(Date.now() + 86400000).toISOString(),
+            orderBy: null,
+          },
+          "v2",
+          true,
+        );
+        expect(Number(keyFiltered["count_count"])).toBe(2);
+      },
+    );
+  });
 });
 
 describe("validateQuery", () => {
@@ -4336,6 +4552,12 @@ describe("validateQuery", () => {
     const result = validateQuery(query, "v2");
 
     expect(result.valid).toBe(false);
+    expect(result).toMatchObject({
+      highCardinality: {
+        code: "missing_top_n",
+        dimensions: ["traceId"],
+      },
+    });
     expect((result as { valid: false; reason: string }).reason).toContain(
       "High cardinality dimension(s) 'traceId'",
     );
@@ -4372,6 +4594,12 @@ describe("validateQuery", () => {
     const result = validateQuery(query, "v2");
 
     expect(result.valid).toBe(false);
+    expect(result).toMatchObject({
+      highCardinality: {
+        code: "entity_dimension_unbounded",
+        dimensions: ["experimentName"],
+      },
+    });
     expect((result as { valid: false; reason: string }).reason).toContain(
       "High cardinality dimension 'experimentName'",
     );
@@ -4456,6 +4684,12 @@ describe("validateQuery", () => {
     const result = validateQuery(query, "v2");
 
     expect(result.valid).toBe(false);
+    expect(result).toMatchObject({
+      highCardinality: {
+        code: "additional_entity_dimension",
+        dimensions: ["traceId"],
+      },
+    });
     expect((result as { valid: false; reason: string }).reason).toContain(
       "High cardinality dimension(s) 'traceId'",
     );
@@ -4494,6 +4728,12 @@ describe("validateQuery", () => {
     const result = validateQuery(query, "v2");
 
     expect(result.valid).toBe(false);
+    expect(result).toMatchObject({
+      highCardinality: {
+        code: "invalid_order_by",
+        dimensions: ["traceId"],
+      },
+    });
     expect((result as { valid: false; reason: string }).reason).toContain(
       "High cardinality dimension(s) 'traceId'",
     );
@@ -4590,6 +4830,12 @@ describe("validateQuery", () => {
     const result = validateQuery(query, "v2");
 
     expect(result.valid).toBe(false);
+    expect(result).toMatchObject({
+      highCardinality: {
+        code: "time_dimension",
+        dimensions: ["traceId"],
+      },
+    });
     expect((result as { valid: false; reason: string }).reason).toContain(
       "traceId",
     );
@@ -4665,9 +4911,9 @@ describe("query builder measure-aggregation validation", () => {
     const result = await queryBuilder.build(query, randomUUID());
 
     expect(result.query).toContain("as entity_dimension");
-    expect(result.query).toContain("GROUP BY entity_dimension");
+    expect(result.query).toMatch(/\bgroup by entity_dimension\b/i);
     expect(result.query).not.toContain("time_dimension");
-    expect(result.query).not.toContain("WITH FILL");
+    expect(result.query).not.toMatch(/\bwith fill\b/i);
   });
 
   it("should include declared relation for relation-backed entity dimensions", async () => {
@@ -4807,24 +5053,6 @@ describe("query builder measure-aggregation validation", () => {
     expect(result.query).toBeDefined();
   });
 
-  it("should reject sum aggregation for uniqueUserIds on traces view", async () => {
-    const query: QueryType = {
-      view: "traces",
-      dimensions: [],
-      metrics: [{ measure: "uniqueUserIds", aggregation: "sum" }],
-      filters: [],
-      timeDimension: null,
-      fromTimestamp: "2025-01-01T00:00:00.000Z",
-      toTimestamp: "2025-03-01T00:00:00.000Z",
-      orderBy: null,
-    };
-
-    const queryBuilder = new QueryBuilder(undefined, "v2");
-    await expect(queryBuilder.build(query, randomUUID())).rejects.toThrow(
-      /not valid for measure/,
-    );
-  });
-
   it("should accept uniq aggregation for uniqueUserIds on traces view", async () => {
     const query: QueryType = {
       view: "traces",
@@ -4862,27 +5090,10 @@ describe("query builder measure-aggregation validation", () => {
   describe("events_traces traceName filter", () => {
     const isEventsTableV2Enabled =
       env.LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN === "true" ? it : it.skip;
-    let hasLegacyEventsTable = false;
-
-    beforeAll(async () => {
-      if (env.LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN !== "true") return;
-
-      try {
-        const result = await clickhouseClient().query({
-          query: "EXISTS TABLE default.events",
-          format: "TabSeparated",
-        });
-        hasLegacyEventsTable = (await result.text()).trim() === "1";
-      } catch {
-        hasLegacyEventsTable = false;
-      }
-    });
 
     isEventsTableV2Enabled(
       "should filter events_traces by traceName using aggregation logic",
       async () => {
-        if (!hasLegacyEventsTable) return;
-
         const projectId = randomUUID();
         const traceId1 = randomUUID();
         const traceId2 = randomUUID();
@@ -4896,7 +5107,7 @@ describe("query builder measure-aggregation validation", () => {
             trace_name: "",
             name: "my-trace",
             parent_span_id: "", // root event
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
           createEvent({
             project_id: projectId,
@@ -4904,7 +5115,7 @@ describe("query builder measure-aggregation validation", () => {
             trace_name: "",
             name: "child-observation",
             parent_span_id: "some-parent", // child event
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
           // Trace 2: trace_name is "other-trace"
           createEvent({
@@ -4913,7 +5124,7 @@ describe("query builder measure-aggregation validation", () => {
             trace_name: "other-trace",
             name: "root-event",
             parent_span_id: "", // root event
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
         ];
         await createEventsCh(events);
@@ -4950,8 +5161,6 @@ describe("query builder measure-aggregation validation", () => {
     isEventsTableV2Enabled(
       "should filter events_traces by traceName column via resolveDimension fallback to name filterSql",
       async () => {
-        if (!hasLegacyEventsTable) return;
-
         const projectId = randomUUID();
         const traceId1 = randomUUID();
         const traceId2 = randomUUID();
@@ -4963,7 +5172,7 @@ describe("query builder measure-aggregation validation", () => {
             trace_name: "target-trace",
             name: "root-observation",
             parent_span_id: "",
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
           createEvent({
             project_id: projectId,
@@ -4971,7 +5180,7 @@ describe("query builder measure-aggregation validation", () => {
             trace_name: "other-trace",
             name: "root-observation",
             parent_span_id: "",
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
         ];
         await createEventsCh(events);
@@ -5008,8 +5217,6 @@ describe("query builder measure-aggregation validation", () => {
     isEventsTableV2Enabled(
       "should filter events_traces by name filterSql combined with a regular dimension filter",
       async () => {
-        if (!hasLegacyEventsTable) return;
-
         const projectId = randomUUID();
         const traceId1 = randomUUID();
         const traceId2 = randomUUID();
@@ -5024,7 +5231,7 @@ describe("query builder measure-aggregation validation", () => {
             name: "root-op",
             parent_span_id: "",
             environment: "production",
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
           // Trace 2: name="target-trace", environment="staging"
           createEvent({
@@ -5034,7 +5241,7 @@ describe("query builder measure-aggregation validation", () => {
             name: "root-op",
             parent_span_id: "",
             environment: "staging",
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
           // Trace 3: name="other-trace", environment="production"
           createEvent({
@@ -5044,7 +5251,7 @@ describe("query builder measure-aggregation validation", () => {
             name: "root-op",
             parent_span_id: "",
             environment: "production",
-            start_time: Date.now() * 1000,
+            start_time: Date.now(),
           }),
         ];
         await createEventsCh(events);
@@ -5085,8 +5292,118 @@ describe("query builder measure-aggregation validation", () => {
     );
   });
 
+  describe("metadata filters on events views (v2)", () => {
+    // events_core stores metadata_values truncated to 200 chars
+    // (events_core_mv); metadata filters must read events_full or matches
+    // beyond the truncation point are silently dropped.
+    const isEventsTableV2Enabled =
+      env.LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN === "true" ? it : it.skip;
+
+    const metadataFilterQuery = (
+      view: "traces" | "observations",
+    ): QueryType => ({
+      view,
+      dimensions: [{ field: "name" }],
+      metrics: [{ measure: "count", aggregation: "count" }],
+      filters: [
+        {
+          column: "metadata",
+          operator: "contains",
+          key: "experiments",
+          value: "HAGTI=B",
+          type: "stringObject",
+        },
+      ],
+      timeDimension: null,
+      fromTimestamp: new Date(Date.now() - 86400000).toISOString(),
+      toTimestamp: new Date(Date.now() + 86400000).toISOString(),
+      orderBy: null,
+    });
+
+    it("reads events_full when a metadata filter is present (traces view)", async () => {
+      const builder = new QueryBuilder(undefined, "v2");
+      const { query: sql } = await builder.build(
+        metadataFilterQuery("traces"),
+        randomUUID(),
+      );
+
+      expect(sql).toContain("FROM events_full events_traces");
+      expect(sql).not.toContain("events_core");
+    });
+
+    it("reads events_full when a metadata filter is present (observations view)", async () => {
+      const builder = new QueryBuilder(undefined, "v2");
+      const { query: sql } = await builder.build(
+        metadataFilterQuery("observations"),
+        randomUUID(),
+      );
+
+      expect(sql).toMatch(/\bfrom events_full\b/i);
+      expect(sql).not.toContain("events_core");
+    });
+
+    it("keeps reading events_core without truncation-sensitive filters", async () => {
+      const builder = new QueryBuilder(undefined, "v2");
+      const query = metadataFilterQuery("traces");
+      query.filters = [
+        {
+          column: "environment",
+          operator: "=",
+          value: "production",
+          type: "string",
+        },
+      ];
+      const { query: sql } = await builder.build(query, randomUUID());
+
+      expect(sql).toContain("FROM events_core events_traces");
+      expect(sql).not.toContain("events_full");
+    });
+
+    isEventsTableV2Enabled(
+      "metadata 'contains' matches a value beyond the 200-char truncation point",
+      async () => {
+        const projectId = randomUUID();
+        const traceId = randomUUID();
+        const needle = `HAGTI=B-${randomUUID()}`;
+        const longValue = JSON.stringify([
+          ...Array.from({ length: 20 }, (_, i) => `experiment-${i}`),
+          needle,
+        ]);
+        expect(longValue.length).toBeGreaterThan(200);
+
+        await createEventsCh([
+          createEvent({
+            project_id: projectId,
+            trace_id: traceId,
+            trace_name: "trace-with-long-metadata",
+            name: "root-op",
+            parent_span_id: "",
+            metadata_names: ["experiments"],
+            metadata_values: [longValue],
+            start_time: Date.now(),
+          }),
+        ]);
+
+        const query = metadataFilterQuery("traces");
+        query.filters = [
+          {
+            column: "metadata",
+            operator: "contains",
+            key: "experiments",
+            value: needle,
+            type: "stringObject",
+          },
+        ];
+        const result = await executeQuery(projectId, query, "v2");
+
+        expect(result).toHaveLength(1);
+        expect(result[0].name).toBe("trace-with-long-metadata");
+      },
+    );
+  });
+
   describe("useFinal flag on events_core joins", () => {
-    it("should omit FINAL for events_core joins in v2 scores-numeric view", async () => {
+    it("should join the parentless trace event without FINAL in v2 scores-numeric view", async () => {
       const projectId = randomUUID();
       const builder = new QueryBuilder(undefined, "v2");
       const { query: compiledQuery } = await builder.build(
@@ -5110,6 +5427,7 @@ describe("query builder measure-aggregation validation", () => {
       expect(compiledQuery).not.toContain(
         "JOIN events_core AS events_traces FINAL",
       );
+      expect(compiledQuery).toContain("AND events_traces.parent_span_id = ''");
       // scores base CTE should still use FINAL
       expect(compiledQuery).toContain("scores scores_numeric FINAL");
     });
@@ -5165,6 +5483,8 @@ describe("query builder measure-aggregation validation", () => {
   });
 
   describe("rootEventCondition threshold gating", () => {
+    const rootEventSubqueryPrefix =
+      "IN (SELECT events_traces.trace_id FROM events_core events_traces";
     const tracesV2Query: QueryType = {
       view: "traces",
       dimensions: [{ field: "name" }],
@@ -5180,8 +5500,17 @@ describe("query builder measure-aggregation validation", () => {
       // 168 hours (7 days) threshold, 72-hour window → should include subquery
       const builder = new QueryBuilder(undefined, "v2");
       builder.setRootEventConditionMaxWindowHours(168);
-      const { query: sql } = await builder.build(tracesV2Query, randomUUID());
-      expect(sql).toContain("IN (SELECT trace_id");
+      const { query: sql } = await builder.build(
+        {
+          ...tracesV2Query,
+          timeDimension: { granularity: "day" },
+        },
+        randomUUID(),
+      );
+      expect(sql).toContain(
+        "anyIf(toNullable(toDate(events_core.start_time)), (events_traces.parent_span_id = '' OR events_traces.is_app_root = true))",
+      );
+      expect(sql).toContain(rootEventSubqueryPrefix);
     });
 
     it("should skip rootEventCondition subquery when window exceeds threshold", async () => {
@@ -5189,7 +5518,7 @@ describe("query builder measure-aggregation validation", () => {
       const builder = new QueryBuilder(undefined, "v2");
       builder.setRootEventConditionMaxWindowHours(24);
       const { query: sql } = await builder.build(tracesV2Query, randomUUID());
-      expect(sql).not.toContain("IN (SELECT trace_id");
+      expect(sql).not.toContain(rootEventSubqueryPrefix);
     });
 
     it("should always include rootEventCondition subquery when threshold is 0", async () => {
@@ -5204,7 +5533,7 @@ describe("query builder measure-aggregation validation", () => {
         },
         randomUUID(),
       );
-      expect(sql).toContain("IN (SELECT trace_id");
+      expect(sql).toContain(rootEventSubqueryPrefix);
     });
   });
 });

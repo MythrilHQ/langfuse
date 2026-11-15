@@ -11,10 +11,22 @@ import {
   createFilterFromFilterState,
   getProjectIdDefaultFilter,
 } from "../queries/clickhouse-sql/factory";
-import { orderByToClickhouseSql } from "../queries";
+import { orderByToClickhouseSql } from "../queries/clickhouse-sql/orderby-factory";
 import { scoreBooleansAggregation } from "../queries/clickhouse-sql/query-fragments";
-import { shouldSkipObservationsFinal } from "../queries/clickhouse-sql/query-options";
+import {
+  shouldSkipObservationsFinal,
+  shouldSkipScoresDedup,
+} from "../queries/clickhouse-sql/query-options";
+import {
+  planScoreFilterPushdown,
+  resolveScoreDataRequirement,
+} from "../queries/clickhouse-sql/score-filter-pushdown";
 import { LISTABLE_SCORE_TYPES } from "../../domain/scores";
+import {
+  TRACE_EXPORT_FIELDS,
+  TRACE_EXPORT_FIELD_GROUPS,
+  type TraceExportFieldGroup,
+} from "../../domain/export-field-groups";
 import { OrderByState } from "../../interfaces/orderBy";
 import snakeCase from "lodash/snakeCase";
 import { FilterState } from "../../types";
@@ -25,7 +37,10 @@ import {
 } from "../queries/clickhouse-sql/clickhouse-filter";
 import { TraceRecordReadType } from "./definitions";
 import { tracesTableUiColumnDefinitions } from "../tableMappings/mapTracesTable";
-import { UiColumnMappings, ColumnDefinition } from "../../tableDefinitions";
+import {
+  UiColumnMappings,
+  ColumnDefinition,
+} from "../../tableDefinitions/types";
 import { tracesTableCols } from "../../tableDefinitions/tracesTable";
 import {
   convertDateToClickhouseDateTime,
@@ -42,11 +57,11 @@ import {
 } from "./constants";
 import { env } from "../../env";
 import { ClickHouseClientConfigOptions } from "@clickhouse/client";
-import { recordDistribution } from "../instrumentation";
+import { recordDistribution, traceException } from "../instrumentation";
 import type { AnalyticsTraceEvent } from "../analytics-integrations/types";
 import { DEFAULT_RENDERING_PROPS, RenderingProps } from "../utils/rendering";
 import { logger } from "../logger";
-import { traceException } from "../instrumentation";
+
 import { prisma } from "../../db";
 
 /**
@@ -361,9 +376,13 @@ export const hasAnyTrace = async (projectId: string) => {
 export const getTraceCountsByProjectInCreationInterval = async ({
   start,
   end,
+  projectId,
+  projectIds,
 }: {
   start: Date;
   end: Date;
+  projectId?: string;
+  projectIds?: string[];
 }) => {
   const query = `
     SELECT
@@ -372,6 +391,8 @@ export const getTraceCountsByProjectInCreationInterval = async ({
     FROM traces
     WHERE created_at >= {start: DateTime64(3)}
     AND created_at < {end: DateTime64(3)}
+    ${projectId ? "AND project_id = {projectId: String}" : ""}
+    ${projectIds ? "AND project_id IN ({projectIds: Array(String)})" : ""}
     GROUP BY project_id
   `;
 
@@ -380,6 +401,8 @@ export const getTraceCountsByProjectInCreationInterval = async ({
     params: {
       start: convertDateToClickhouseDateTime(start),
       end: convertDateToClickhouseDateTime(end),
+      ...(projectId ? { projectId } : {}),
+      ...(projectIds ? { projectIds } : {}),
     },
     clickhouseConfigs: {
       request_timeout: 300000, // 5 minutes timeout
@@ -494,16 +517,24 @@ export const getTraceByIdFromTracesTable = async ({
     tags: { projectId },
   };
 
-  const inputColumn = excludeInputOutput
-    ? "''"
-    : renderingProps.truncated
-      ? `leftUTF8(input, ${env.LANGFUSE_SERVER_SIDE_IO_CHAR_LIMIT})`
-      : "input";
-  const outputColumn = excludeInputOutput
-    ? "''"
-    : renderingProps.truncated
-      ? `leftUTF8(output, ${env.LANGFUSE_SERVER_SIDE_IO_CHAR_LIMIT})`
-      : "output";
+  const inputColumn = (() => {
+    if (excludeInputOutput) {
+      return "''";
+    }
+    if (renderingProps.truncated) {
+      return `leftUTF8(input, ${env.LANGFUSE_SERVER_SIDE_IO_CHAR_LIMIT})`;
+    }
+    return "input";
+  })();
+  const outputColumn = (() => {
+    if (excludeInputOutput) {
+      return "''";
+    }
+    if (renderingProps.truncated) {
+      return `leftUTF8(output, ${env.LANGFUSE_SERVER_SIDE_IO_CHAR_LIMIT})`;
+    }
+    return "output";
+  })();
   // map() (not a '{}' string literal) so the excluded column keeps the
   // Map type and converts to an empty object in the domain model.
   const metadataColumn = excludeMetadata ? "map()" : "metadata";
@@ -1184,37 +1215,26 @@ export const getUserMetrics = async (
 };
 
 // Shared query for both the standard (parsed) and Parquet (`exec` binary)
-// trace export paths, so the SELECT/WHERE stays in one place.
+// trace export paths, so the SELECT/WHERE stays in one place. Deselected
+// field group columns are dropped; the remaining columns keep their order.
 const buildTracesForBlobStorageExportQuery = (
   projectId: string,
   minTimestamp: Date,
   maxTimestamp: Date,
+  fieldGroups: TraceExportFieldGroup[],
 ) => {
   const traceTable = "traces";
+  const columns = TRACE_EXPORT_FIELDS.filter(({ group }) =>
+    fieldGroups.includes(group),
+  ).map(({ field }) => field);
 
   const query = `
     SELECT
-      id,
-      timestamp,
-      name,
-      environment,
-      project_id,
-      metadata,
-      user_id,
-      session_id,
-      release,
-      version,
-      public as public,
-      bookmarked as bookmarked,
-      tags,
-      input as input,
-      output as output,
-      created_at,
-      updated_at
+      ${columns.join(",\n      ")}
     FROM ${traceTable} FINAL
     WHERE project_id = {projectId: String}
     AND timestamp >= {minTimestamp: DateTime64(3)}
-    AND timestamp <= {maxTimestamp: DateTime64(3)}
+    AND timestamp < {maxTimestamp: DateTime64(3)}
   `;
 
   return {
@@ -1229,6 +1249,7 @@ const buildTracesForBlobStorageExportQuery = (
     clickhouseConfigs: {
       request_timeout: env.LANGFUSE_CLICKHOUSE_DATA_EXPORT_REQUEST_TIMEOUT_MS,
     },
+    preferredClickhouseService: "ReadOnly" as const,
   };
 };
 
@@ -1236,9 +1257,15 @@ export const getTracesForBlobStorageExport = function (
   projectId: string,
   minTimestamp: Date,
   maxTimestamp: Date,
+  fieldGroups: TraceExportFieldGroup[] = [...TRACE_EXPORT_FIELD_GROUPS],
 ) {
   return queryClickhouseStream<Record<string, unknown>>(
-    buildTracesForBlobStorageExportQuery(projectId, minTimestamp, maxTimestamp),
+    buildTracesForBlobStorageExportQuery(
+      projectId,
+      minTimestamp,
+      maxTimestamp,
+      fieldGroups,
+    ),
   );
 };
 
@@ -1248,12 +1275,14 @@ export const getTracesForBlobStorageExportParquet = function (
   projectId: string,
   minTimestamp: Date,
   maxTimestamp: Date,
+  fieldGroups: TraceExportFieldGroup[] = [...TRACE_EXPORT_FIELD_GROUPS],
 ) {
   return queryClickhouseExecRaw({
     ...buildTracesForBlobStorageExportQuery(
       projectId,
       minTimestamp,
       maxTimestamp,
+      fieldGroups,
     ),
     format: "Parquet",
     clickhouseSettings: BLOB_EXPORT_PARQUET_CLICKHOUSE_SETTINGS,
@@ -1276,7 +1305,7 @@ export const getTracesForAnalyticsIntegrations = async function* (
              o.trace_id,
              sum(total_cost) as total_cost,
              count(*) as observation_count,
-             date_diff('millisecond', least(min(start_time), min(end_time)), greatest(max(start_time), max(end_time))) as latency_milliseconds
+             if(min(end_time) IS NULL, NULL, date_diff('millisecond', least(min(start_time), min(end_time)), greatest(max(start_time), max(end_time)))) as latency_milliseconds
       FROM observations o FINAL
       WHERE o.project_id = {projectId: String}
       AND o.start_time >= {minTimestamp: DateTime64(3)} - ${TRACE_TO_OBSERVATIONS_INTERVAL}
@@ -1377,6 +1406,7 @@ export const getTracesByIdsForAnyProject = async (traceIds: string[]) => {
     params: {
       traceIds,
     },
+    tags: { surface: "ssr", route: "trace_redirect" },
   });
 
   return records.map((record) => ({
@@ -1617,6 +1647,12 @@ async function buildTracesBaseQuery(
       f.field === "s.score_categories" ||
       f.field === "s.score_booleans",
   );
+  const scoreRowsFilter = planScoreFilterPushdown({
+    filters: filter,
+    scoreDataRequirement: resolveScoreDataRequirement({
+      selectsScoreData: select.includeScores,
+    }),
+  });
 
   const ctes = [];
 
@@ -1637,7 +1673,7 @@ async function buildTracesBaseQuery(
       SELECT
         trace_id,
         project_id,
-        ${includeMetricsInCTE ? "sum(total_cost) as total_cost, date_diff('millisecond', least(min(start_time), min(end_time)), greatest(max(start_time), max(end_time))) as latency_milliseconds, " : ""}
+        ${includeMetricsInCTE ? "sum(total_cost) as total_cost, if(min(end_time) IS NULL, NULL, date_diff('millisecond', least(min(start_time), min(end_time)), greatest(max(start_time), max(end_time)))) as latency_milliseconds, " : ""}
         sumMap(usage_details) as usage_details,
         sumMap(cost_details) as cost_details,
         multiIf(arrayExists(x -> x = 'ERROR', groupArray(level)), 'ERROR', arrayExists(x -> x = 'WARNING', groupArray(level)), 'WARNING', arrayExists(x -> x = 'DEFAULT', groupArray(level)), 'DEFAULT', 'DEBUG') AS aggregated_level,
@@ -1676,13 +1712,14 @@ async function buildTracesBaseQuery(
           data_type,
           string_value,
           avg(value) as avg_value
-        FROM scores FINAL
+        FROM scores ${shouldSkipScoresDedup(projectId) ? "" : "FINAL"}
         WHERE project_id = {projectId: String}
         AND session_id IS NULL
         AND dataset_run_id IS NULL
         AND data_type IN ({dataTypes: Array(String)})
         ${fromTimeFilter ? `AND timestamp >= {cteFromTimeFilter: DateTime64(3)}` : ""}
         ${environmentFilter.length() > 0 ? `AND ${appliedEnvironmentFilter.query}` : ""}
+        ${scoreRowsFilter ? `AND ${scoreRowsFilter.query}` : ""}
         GROUP BY
           project_id,
           trace_id,
@@ -1709,6 +1746,7 @@ async function buildTracesBaseQuery(
       AND data_type IN ({dataTypes: Array(String)})
       ${fromTimeFilter ? `AND timestamp >= {cteFromTimeFilter: DateTime64(3)}` : ""}
       ${environmentFilter.length() > 0 ? `AND ${appliedEnvironmentFilter.query}` : ""}
+      ${scoreRowsFilter ? `AND ${scoreRowsFilter.query}` : ""}
       GROUP BY project_id, trace_id
     )`);
     }
@@ -1850,6 +1888,7 @@ async function buildTracesBaseQuery(
   const params = {
     ...appliedEnvironmentFilter.params,
     ...appliedFilter.params,
+    ...scoreRowsFilter?.params,
     projectId,
     dataTypes: LISTABLE_SCORE_TYPES,
     ...(pagination !== undefined

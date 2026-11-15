@@ -1,13 +1,19 @@
-import { LangfuseInternalTraceEnvironment } from "@langfuse/shared/src/server";
+import {
+  LangfuseInternalTraceEnvironment,
+  isInternalEvalEnvironment,
+} from "@langfuse/shared/src/server";
+
+export { isInternalEvalEnvironment } from "@langfuse/shared/src/server";
 
 /**
  * Final, fail-closed loop safeguard at eval EXECUTION time.
  *
  * Internal Langfuse executions (LLM-as-a-judge, code evals, natural-language
- * filters) write their telemetry into reserved `langfuse-*` environments. An
- * eval whose TARGET lives in such an environment is an eval-of-an-eval: it
- * would spawn another internal execution, whose telemetry could be evaluated
- * again — an infinite loop with per-cycle LLM cost.
+ * filters) write their telemetry into reserved `langfuse-*` environments.
+ * Public ingestion may store a recognized alias without that prefix. An eval
+ * whose TARGET lives in either form is an eval-of-an-eval: it would spawn
+ * another internal execution, whose telemetry could be evaluated again — an
+ * infinite loop with per-cycle LLM cost.
  *
  * Scheduling-time guards exist per entry point (trace-upsert in
  * createEvalJobs, the OTel queue's observation-eval guard), but every new
@@ -26,7 +32,7 @@ import { LangfuseInternalTraceEnvironment } from "@langfuse/shared/src/server";
 export function isEvalTargetEnvironmentAllowed(
   environment: string | null | undefined,
 ): boolean {
-  if (!environment?.startsWith("langfuse")) {
+  if (!isInternalEvalEnvironment(environment)) {
     return true;
   }
 

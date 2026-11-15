@@ -1,15 +1,19 @@
 import { Responsive } from "react-grid-layout";
 import "react-grid-layout/css/styles.css";
 import "react-resizable/css/styles.css";
-import { type WidgetPlacement } from "../components/DashboardWidget";
+import {
+  DashboardWidget,
+  type WidgetPlacement,
+} from "@/src/features/widgets/components/DashboardWidget";
 import { type WidgetExportSource } from "@/src/features/widgets/utils/import-export-utils";
 import {
   PresetDashboardWidget,
   type PresetPlacement,
 } from "../components/PresetDashboardWidget";
-import { DashboardWidget } from "@/src/features/widgets";
+import type { ResolvedReadPath } from "@/src/features/events/hooks/useReadPath";
 import { type FilterState } from "@langfuse/shared";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { type ChartProps } from "@/src/features/widgets/chart-library/chart-props";
 
 export type DashboardPlacement = WidgetPlacement | PresetPlacement;
 
@@ -71,6 +75,7 @@ export function DashboardGrid({
   canEdit,
   dashboardId,
   projectId,
+  readPath,
   dateRange,
   filterState,
   onDeleteWidget,
@@ -78,7 +83,6 @@ export function DashboardGrid({
   getWidgetSchedulerId,
   onLockedEditAttempt,
   readOnly,
-  onPasteWidget,
   onDuplicateWidget,
   onDuplicatePreset,
 }: {
@@ -87,6 +91,8 @@ export function DashboardGrid({
   canEdit: boolean;
   dashboardId: string;
   projectId: string;
+  /** Resolved by the page controller — widgets must not guess the version. */
+  readPath: ResolvedReadPath;
   dateRange: { from: Date; to: Date } | undefined;
   filterState: FilterState;
   onDeleteWidget: (tileId: string) => void;
@@ -101,9 +107,7 @@ export function DashboardGrid({
   onLockedEditAttempt?: () => void;
   /** Pure viewing surface (e.g. Home): tiles render no edit affordances. */
   readOnly?: boolean;
-  /** Paste the clipboard widget/card next to a tile (editable dashboards only). */
-  onPasteWidget?: (anchor: DashboardPlacement) => void;
-  /** Duplicate a tile's widget next to it (editable dashboards only). */
+  /** Clone a tile's widget next to it (editable dashboards only). */
   onDuplicateWidget?: (
     anchor: WidgetPlacement,
     widget: WidgetExportSource,
@@ -111,12 +115,31 @@ export function DashboardGrid({
   /** Duplicate a preset card next to it (editable dashboards only). */
   onDuplicatePreset?: (anchor: PresetPlacement) => void;
 }) {
+  const [activeChartKey, setActiveChartKey] = useState<string>();
+  const chartSync: ChartProps["sync"] = {
+    activeKey: activeChartKey,
+    onActiveKeyChange: setActiveChartKey,
+  };
   const { containerRef, width } = useDebouncedContainerWidth(200);
+  const [contentHeights, setContentHeights] = useState<Record<string, number>>(
+    {},
+  );
+  const handleContentHeightChange = useCallback(
+    (placementId: string, height: number) => {
+      setContentHeights((current) => {
+        if (current[placementId] === height) return current;
+        return { ...current, [placementId]: height };
+      });
+    },
+    [],
+  );
   // Rows stay 16:9-proportional to column width, with a floor so tiles keep a
   // usable height on narrow screens — below the floor, widget content (chart
   // floors, table rows) no longer fits and tiles scroll internally; the grid
   // grows vertically instead. (LFE-10813)
   const MIN_ROW_HEIGHT = 58;
+  // Matches the page padding (p-3) around the grid.
+  const GRID_GAP = 12;
   const rowHeight =
     width !== null ? Math.max(MIN_ROW_HEIGHT, ((width / 12) * 9) / 16) : 150;
 
@@ -127,16 +150,26 @@ export function DashboardGrid({
   const isSmallScreen = useMediaQuery("(max-width: 1023.98px)");
 
   // Convert WidgetPlacement to react-grid-layout format
-  const layout = widgets.map((w) => ({
-    i: w.id,
-    x: w.x,
-    y: w.y,
-    w: w.x_size,
-    h: w.y_size,
-    isDraggable: canEdit && !isSmallScreen, // Disable dragging on small screens
-    minW: 2,
-    minH: 2,
-  }));
+  const layout = widgets.map((w) => {
+    const contentHeight = contentHeights[w.id];
+    const contentRows = contentHeight
+      ? Math.ceil((contentHeight + GRID_GAP) / (rowHeight + GRID_GAP))
+      : 0;
+
+    return {
+      i: w.id,
+      x: w.x,
+      y: w.y,
+      w: w.x_size,
+      h:
+        w.type === "preset" && w.presetId === "home-score-analytics"
+          ? Math.max(w.y_size, contentRows)
+          : w.y_size,
+      isDraggable: canEdit && !isSmallScreen, // Disable dragging on small screens
+      minW: 2,
+      minH: 2,
+    };
+  });
 
   const handleLayoutChange = (newLayout: any[]) => {
     // Safety checks: prevent layout changes on small screens and when editing is disabled
@@ -170,7 +203,9 @@ export function DashboardGrid({
     widget.type === "preset" ? (
       <PresetDashboardWidget
         dashboardId={dashboardId}
+        chartSync={chartSync}
         projectId={projectId}
+        readPath={readPath}
         placement={widget}
         dateRange={dateRange}
         filterState={filterState}
@@ -179,13 +214,22 @@ export function DashboardGrid({
         schedulerId={getWidgetSchedulerId?.(widget.id)}
         onLockedEditAttempt={onLockedEditAttempt}
         readOnly={readOnly}
-        onPasteWidget={onPasteWidget}
         onDuplicatePreset={onDuplicatePreset}
+        heightBehavior={
+          widget.presetId === "home-score-analytics"
+            ? {
+                mode: "content",
+                onHeightChange: handleContentHeightChange,
+              }
+            : { mode: "fixed" }
+        }
       />
     ) : (
       <DashboardWidget
         dashboardId={dashboardId}
+        chartSync={chartSync}
         projectId={projectId}
+        readPath={readPath}
         placement={widget}
         dateRange={dateRange}
         filterState={filterState}
@@ -194,7 +238,6 @@ export function DashboardGrid({
         schedulerId={getWidgetSchedulerId?.(widget.id)}
         onLockedEditAttempt={onLockedEditAttempt}
         readOnly={readOnly}
-        onPasteWidget={onPasteWidget}
         onDuplicateWidget={onDuplicateWidget}
       />
     );
@@ -202,7 +245,7 @@ export function DashboardGrid({
   // Render flex layout for small screens
   if (isSmallScreen) {
     return (
-      <div className="flex w-full flex-col gap-4">
+      <div className="flex w-full flex-col gap-3">
         {widgets
           .slice()
           .sort((a, b) => a.y - b.y || a.x - b.x) // Sort by position for consistent order
@@ -234,7 +277,8 @@ export function DashboardGrid({
           width={width}
           layouts={{ lg: layout }}
           cols={{ lg: 12, md: 12, sm: 12, xs: 12, xxs: 12 }}
-          margin={[16, 16]}
+          margin={[GRID_GAP, GRID_GAP]}
+          containerPadding={[0, 0]}
           rowHeight={rowHeight}
           isDraggable={canEdit}
           isResizable={canEdit}

@@ -3,7 +3,6 @@ import { NextResponse, type NextRequest } from "next/server";
 import {
   BaseError,
   ForbiddenError,
-  InternalServerError,
   InvalidRequestError,
 } from "@langfuse/shared";
 
@@ -11,16 +10,16 @@ import { authorizeRequestOrThrow } from "./authorizeRequest";
 import { validateChatCompletionBody } from "./validateChatCompletionBody";
 
 import { env } from "@/src/env.mjs";
-import { prisma } from "@langfuse/shared/src/db";
 import {
-  LLMApiKeySchema,
   createLLMOutput,
   createLLMToolSet,
   generateLLMText,
+  getClientInitiatedNonStreamingLlmTimeoutMs,
   getLLMErrorInfo,
   logger,
   contextWithLangfuseProps,
   mapLegacyLLMCompletionParams,
+  resolveLlmApiKey,
   streamLLMText,
 } from "@langfuse/shared/src/server";
 import * as opentelemetry from "@opentelemetry/api";
@@ -28,7 +27,7 @@ import * as opentelemetry from "@opentelemetry/api";
 export default async function chatCompletionHandler(req: NextRequest) {
   try {
     const body = validateChatCompletionBody(await req.json());
-    const { userId } = await authorizeRequestOrThrow(body.projectId);
+    const { userId } = await authorizeRequestOrThrow(body.projectId, req);
 
     const blockedUsers = env.LANGFUSE_BLOCKED_USERIDS_CHATCOMPLETION;
     if (blockedUsers.has(userId)) {
@@ -51,24 +50,15 @@ export default async function chatCompletionHandler(req: NextRequest) {
         streaming,
       } = body;
 
-      const LLMApiKey = await prisma.llmApiKeys.findFirst({
-        where: {
-          projectId: body.projectId,
-          provider: modelParams.provider,
-        },
+      const llmApiKey = await resolveLlmApiKey({
+        projectId: body.projectId,
+        provider: modelParams.provider,
       });
 
-      if (!LLMApiKey)
+      if (!llmApiKey)
         throw new InvalidRequestError(
           `No ${modelParams.provider} API key found in project. Please add one in the project settings.`,
         );
-
-      const parsedKey = LLMApiKeySchema.safeParse(LLMApiKey);
-      if (!parsedKey.success) {
-        throw new InternalServerError(
-          `Could not parse API key for provider ${body.modelParams.provider}: ${parsedKey.error.message}`,
-        );
-      }
 
       // If messages contain tool results, we include tools in the request
       const hasToolResults = messages.some((msg) => msg.type === "tool-result");
@@ -106,14 +96,18 @@ export default async function chatCompletionHandler(req: NextRequest) {
           : messages;
 
       const completionParams = mapLegacyLLMCompletionParams({
-        connection: parsedKey.data,
+        connection: llmApiKey,
         messages: fixedMessages,
         modelParams,
       });
+      const nonStreamingCompletionParams = {
+        ...completionParams,
+        timeout: getClientInitiatedNonStreamingLlmTimeoutMs(),
+      };
 
       if (structuredOutputSchema) {
         const result = await generateLLMText({
-          ...completionParams,
+          ...nonStreamingCompletionParams,
           output: createLLMOutput(structuredOutputSchema),
         });
         return NextResponse.json(result.output);
@@ -121,7 +115,7 @@ export default async function chatCompletionHandler(req: NextRequest) {
 
       if ((tools && tools.length > 0) || hasToolResults) {
         const result = await generateLLMText({
-          ...completionParams,
+          ...nonStreamingCompletionParams,
           tools: createLLMToolSet(tools ?? []),
         });
         return NextResponse.json({
@@ -154,7 +148,7 @@ export default async function chatCompletionHandler(req: NextRequest) {
           },
         );
       }
-      const completion = await generateLLMText(completionParams);
+      const completion = await generateLLMText(nonStreamingCompletionParams);
       return NextResponse.json({
         content: completion.text,
         ...(completion.finalStep.reasoningText
@@ -177,7 +171,10 @@ export default async function chatCompletionHandler(req: NextRequest) {
 
     if (err instanceof Error) {
       const llmError = getLLMErrorInfo(err);
-      const statusCode = llmError?.statusCode ?? 500;
+      // Semantic AI SDK failures (e.g. no structured output) have no HTTP
+      // status. Treat them as client/provider operational errors, not 500s.
+      const statusCode =
+        llmError?.statusCode ?? (llmError?.kind === "ai-sdk" ? 400 : 500);
       const errorMessage = llmError?.message ?? "An internal error occurred";
 
       return NextResponse.json(

@@ -1,9 +1,7 @@
 import { type Plan } from "@langfuse/shared";
 
 // Entitlements: Binary feature access
-// Exported to silence @typescript-eslint/no-unused-vars v8 warning
-// (used for type extraction via typeof, which is a legitimate pattern)
-export const entitlements = [
+const entitlements = [
   // features
   "rbac-project-roles",
   "cloud-billing",
@@ -18,6 +16,9 @@ export const entitlements = [
   "prompt-protected-labels",
   "admin-api",
   "in-app-agent",
+  "self-host-telemetry-opt-out",
+  "external-media-storage",
+  "storage-iam-role-auth",
 ] as const;
 export type Entitlement = (typeof entitlements)[number];
 
@@ -30,12 +31,25 @@ const cloudAllPlansEntitlements: Entitlement[] = [
 const selfHostedAllPlansEntitlements: Entitlement[] = [
   "trace-deletion",
   "scheduled-blob-exports",
+  "in-app-agent",
+];
+
+// Shared by self-hosted enterprise and government, which adds to it
+const selfHostedEnterpriseEntitlements: Entitlement[] = [
+  ...selfHostedAllPlansEntitlements,
+  "rbac-project-roles",
+  "self-host-allowed-organization-creators",
+  "self-host-ui-customization",
+  "audit-logs",
+  "data-retention",
+  "prompt-protected-labels",
+  "admin-api",
+  "external-media-storage",
+  "storage-iam-role-auth",
 ];
 
 // Entitlement Limits: Limits on the number of resources that can be created/used
-// Exported to silence @typescript-eslint/no-unused-vars v8 warning
-// (used for type extraction via typeof, which is a legitimate pattern)
-export const entitlementLimits = [
+const entitlementLimits = [
   "annotation-queue-count",
   "organization-member-count",
   "data-access-days",
@@ -66,7 +80,7 @@ export const entitlementAccess: Record<
       "annotation-queue-count": 1,
       "model-based-evaluations-count-evaluators": false,
       "prompt-management-count-prompts": false,
-      "monitor-count": 20,
+      "monitor-count": 2,
     },
   },
   "cloud:core": {
@@ -92,14 +106,13 @@ export const entitlementAccess: Record<
       "data-access-days": false,
       "model-based-evaluations-count-evaluators": false,
       "prompt-management-count-prompts": false,
-      "monitor-count": 20,
+      "monitor-count": 50,
     },
   },
   "cloud:team": {
     entitlements: [
       ...cloudAllPlansEntitlements,
       "rbac-project-roles",
-      "audit-logs",
       "data-retention",
       "cloud-multi-tenant-sso",
       "prompt-protected-labels",
@@ -113,7 +126,7 @@ export const entitlementAccess: Record<
       "data-access-days": false,
       "model-based-evaluations-count-evaluators": false,
       "prompt-management-count-prompts": false,
-      "monitor-count": 20,
+      "monitor-count": 50,
     },
   },
   "cloud:enterprise": {
@@ -127,6 +140,8 @@ export const entitlementAccess: Record<
       "admin-api",
       "scheduled-blob-exports",
       "cloud-spend-alerts",
+      "external-media-storage",
+      "storage-iam-role-auth",
     ],
     entitlementLimits: {
       "annotation-queue-count": false,
@@ -134,7 +149,7 @@ export const entitlementAccess: Record<
       "data-access-days": false,
       "model-based-evaluations-count-evaluators": false,
       "prompt-management-count-prompts": false,
-      "monitor-count": 20,
+      "monitor-count": 100,
     },
   },
   oss: {
@@ -145,7 +160,7 @@ export const entitlementAccess: Record<
       "data-access-days": false,
       "model-based-evaluations-count-evaluators": false,
       "prompt-management-count-prompts": false,
-      "monitor-count": 20,
+      "monitor-count": false,
     },
   },
   "self-hosted:pro": {
@@ -156,19 +171,24 @@ export const entitlementAccess: Record<
       "data-access-days": false,
       "model-based-evaluations-count-evaluators": false,
       "prompt-management-count-prompts": false,
-      "monitor-count": 20,
+      "monitor-count": false,
     },
   },
   "self-hosted:enterprise": {
+    entitlements: selfHostedEnterpriseEntitlements,
+    entitlementLimits: {
+      "annotation-queue-count": false,
+      "organization-member-count": false,
+      "data-access-days": false,
+      "model-based-evaluations-count-evaluators": false,
+      "prompt-management-count-prompts": false,
+      "monitor-count": false,
+    },
+  },
+  "self-hosted:gov": {
     entitlements: [
-      ...selfHostedAllPlansEntitlements,
-      "rbac-project-roles",
-      "self-host-allowed-organization-creators",
-      "self-host-ui-customization",
-      "audit-logs",
-      "data-retention",
-      "prompt-protected-labels",
-      "admin-api",
+      ...selfHostedEnterpriseEntitlements,
+      "self-host-telemetry-opt-out",
     ],
     entitlementLimits: {
       "annotation-queue-count": false,
@@ -176,7 +196,7 @@ export const entitlementAccess: Record<
       "data-access-days": false,
       "model-based-evaluations-count-evaluators": false,
       "prompt-management-count-prompts": false,
-      "monitor-count": 20,
+      "monitor-count": false,
     },
   },
 };

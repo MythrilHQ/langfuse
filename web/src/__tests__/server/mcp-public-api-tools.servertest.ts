@@ -51,49 +51,44 @@ import {
 import "@/src/features/mcp/server/bootstrap";
 import { config as mcpRouteConfig } from "@/src/pages/api/public/mcp";
 import { toolRegistry } from "@/src/features/mcp/server/registry";
+import { handleCreateAnnotationQueue } from "@/src/features/mcp/server/annotationQueues/tools/createAnnotationQueue";
+import { handleCreateAnnotationQueueAssignment } from "@/src/features/mcp/server/annotationQueues/tools/createAnnotationQueueAssignment";
+import { handleCreateAnnotationQueueItem } from "@/src/features/mcp/server/annotationQueues/tools/createAnnotationQueueItem";
+import { handleDeleteAnnotationQueueAssignment } from "@/src/features/mcp/server/annotationQueues/tools/deleteAnnotationQueueAssignment";
+import { handleDeleteAnnotationQueueItem } from "@/src/features/mcp/server/annotationQueues/tools/deleteAnnotationQueueItem";
+import { handleGetAnnotationQueue } from "@/src/features/mcp/server/annotationQueues/tools/getAnnotationQueue";
+import { handleGetAnnotationQueueItem } from "@/src/features/mcp/server/annotationQueues/tools/getAnnotationQueueItem";
+import { handleListAnnotationQueueItems } from "@/src/features/mcp/server/annotationQueues/tools/listAnnotationQueueItems";
+import { handleListAnnotationQueues } from "@/src/features/mcp/server/annotationQueues/tools/listAnnotationQueues";
+import { handleUpdateAnnotationQueueItem } from "@/src/features/mcp/server/annotationQueues/tools/updateAnnotationQueueItem";
+import { handleCreateComment } from "@/src/features/mcp/server/comments/tools/createComment";
+import { handleGetComment } from "@/src/features/mcp/server/comments/tools/getComment";
+import { handleListComments } from "@/src/features/mcp/server/comments/tools/listComments";
+import { handleBatchUpsertDatasetItems } from "@/src/features/mcp/server/datasets/tools/batchUpsertDatasetItems";
+import { handleCreateDatasetRunItem } from "@/src/features/mcp/server/datasets/tools/createDatasetRunItem";
+import { handleDeleteDatasetItem } from "@/src/features/mcp/server/datasets/tools/deleteDatasetItem";
+import { handleDeleteDatasetRun } from "@/src/features/mcp/server/datasets/tools/deleteDatasetRun";
+import { handleGetDataset } from "@/src/features/mcp/server/datasets/tools/getDataset";
+import { handleGetDatasetItem } from "@/src/features/mcp/server/datasets/tools/getDatasetItem";
+import { handleGetDatasetRun } from "@/src/features/mcp/server/datasets/tools/getDatasetRun";
+import { handleListDatasetItems } from "@/src/features/mcp/server/datasets/tools/listDatasetItems";
+import { handleListDatasetRunItems } from "@/src/features/mcp/server/datasets/tools/listDatasetRunItems";
+import { handleListDatasetRuns } from "@/src/features/mcp/server/datasets/tools/listDatasetRuns";
+import { handleListDatasets } from "@/src/features/mcp/server/datasets/tools/listDatasets";
 import {
-  handleCreateAnnotationQueue,
-  handleCreateAnnotationQueueAssignment,
-  handleCreateAnnotationQueueItem,
-  handleDeleteAnnotationQueueAssignment,
-  handleDeleteAnnotationQueueItem,
-  handleGetAnnotationQueue,
-  handleGetAnnotationQueueItem,
-  handleListAnnotationQueueItems,
-  handleListAnnotationQueues,
-  handleUpdateAnnotationQueueItem,
-} from "@/src/features/mcp/features/annotationQueues/tools";
-import {
-  handleCreateComment,
-  handleGetComment,
-  handleListComments,
-} from "@/src/features/mcp/features/comments/tools";
-import {
-  handleCreateDatasetRunItem,
-  handleDeleteDatasetItem,
-  handleDeleteDatasetRun,
-  handleGetDataset,
-  handleGetDatasetItem,
-  handleGetDatasetRun,
-  handleListDatasetItems,
-  handleListDatasetRunItems,
-  handleListDatasetRuns,
-  handleListDatasets,
   handleUpsertDataset,
-  handleUpsertDatasetItem,
   upsertDatasetTool,
-} from "@/src/features/mcp/features/datasets/tools";
-import { handleGetHealth } from "@/src/features/mcp/features/health/tools";
-import {
-  handleCreateModel,
-  handleDeleteModel,
-  handleGetModel,
-  handleListModels,
-} from "@/src/features/mcp/features/models/tools";
-import { handleCreateScoreConfig } from "@/src/features/mcp/features/scores/tools/createScoreConfig";
-import { handleGetScoreConfig } from "@/src/features/mcp/features/scores/tools/getScoreConfig";
-import { handleListScoreConfigs } from "@/src/features/mcp/features/scores/tools/listScoreConfigs";
-import { handleUpdateScoreConfig } from "@/src/features/mcp/features/scores/tools/updateScoreConfig";
+} from "@/src/features/mcp/server/datasets/tools/upsertDataset";
+import { handleUpsertDatasetItem } from "@/src/features/mcp/server/datasets/tools/upsertDatasetItem";
+import { handleGetHealth } from "@/src/features/mcp/server/health/tools/getHealth";
+import { handleCreateModel } from "@/src/features/mcp/server/models/tools/createModel";
+import { handleDeleteModel } from "@/src/features/mcp/server/models/tools/deleteModel";
+import { handleGetModel } from "@/src/features/mcp/server/models/tools/getModel";
+import { handleListModels } from "@/src/features/mcp/server/models/tools/listModels";
+import { handleCreateScoreConfig } from "@/src/features/mcp/server/scores/tools/createScoreConfig";
+import { handleGetScoreConfig } from "@/src/features/mcp/server/scores/tools/getScoreConfig";
+import { handleListScoreConfigs } from "@/src/features/mcp/server/scores/tools/listScoreConfigs";
+import { handleUpdateScoreConfig } from "@/src/features/mcp/server/scores/tools/updateScoreConfig";
 
 const createScoreConfig = async (projectId: string) =>
   prisma.scoreConfig.create({
@@ -153,18 +148,21 @@ describe("MCP public API tools", () => {
         "createAnnotationQueue",
         "createComment",
         "listEvaluators",
+        "listManagedEvaluatorTemplates",
         "getEvaluator",
-        "upsertEvaluator",
+        "createEvaluator",
+        "updateEvaluator",
         "listEvaluationRules",
         "getEvaluationRule",
         "createEvaluationRule",
         "createDashboardWidget",
+        "batchUpsertDatasetItems",
         "listDatasets",
         "getHealth",
         "listScores",
         "getScore",
-        "listMonitors",
-        "getMonitor",
+        "listAlerts",
+        "getAlert",
         "createModel",
         "createScoreConfig",
       ]),
@@ -201,11 +199,11 @@ describe("MCP public API tools", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("resolves only the overridden mutating tool for in-app agent keys", async () => {
+  it("resolves allowlisted mutating tools plus reads for in-app agent keys", async () => {
     const context = mockServerContext({
       inAppAgent: {
-        permissions: "single-tool-override",
-        allowedToolName: "upsertDataset",
+        permissions: "tool-allowlist",
+        allowedToolNames: ["upsertDataset"],
       },
     });
 
@@ -217,14 +215,14 @@ describe("MCP public API tools", () => {
     ).resolves.toBeUndefined();
     await expect(
       toolRegistry.getEnabledTool("listDatasets", context),
-    ).resolves.toBeUndefined();
+    ).resolves.toBeTruthy();
   });
 
   it("resolves the dashboard widget creation override for in-app agent keys", async () => {
     const context = mockServerContext({
       inAppAgent: {
-        permissions: "single-tool-override",
-        allowedToolName: "createDashboardWidget",
+        permissions: "tool-allowlist",
+        allowedToolNames: ["createDashboardWidget"],
       },
     });
 
@@ -249,13 +247,16 @@ describe("MCP public API tools", () => {
     expect(destructiveToolNames).toEqual(
       [
         "addDashboardPlacement",
+        "attachEvaluatorToEvaluationRule",
+        "batchUpsertDatasetItems",
         "createChatPrompt",
         "createDashboard",
         "createDashboardWidget",
         "createEvaluationRule",
-        "upsertEvaluator",
+        "createEvaluator",
         "createScore",
         "createScoreConfig",
+        "createSkillVersion",
         "createTextPrompt",
         "deleteAnnotationQueueAssignment",
         "deleteAnnotationQueueItem",
@@ -264,17 +265,23 @@ describe("MCP public API tools", () => {
         "deleteDashboardWidget",
         "deleteDatasetItem",
         "deleteDatasetRun",
+        "deleteDefaultEvaluationModel",
         "deleteEvaluationRule",
         "deleteEvaluator",
         "deleteModel",
         "deleteScoreConfig",
+        "detachEvaluatorFromEvaluationRule",
+        "setDefaultEvaluationModel",
         "updateAnnotationQueueItem",
         "updateDashboard",
         "updateDashboardPlacement",
         "updateDashboardWidget",
         "updateEvaluationRule",
+        "updateEvaluator",
         "updatePromptLabels",
         "updateScoreConfig",
+        "updateSkillLabels",
+        "updateSkillTags",
         "upsertDataset",
         "upsertDatasetItem",
       ].sort(),
@@ -393,7 +400,7 @@ describe("MCP public API tools", () => {
     ).resolves.toBe(assignmentAuditLogCount + 1);
 
     const auditLogCreateSpy = vi
-      .spyOn(prisma, "$transaction")
+      .spyOn(prisma.auditLog, "create")
       .mockRejectedValueOnce(new Error("audit failed"));
 
     try {
@@ -402,7 +409,7 @@ describe("MCP public API tools", () => {
           { queueId: queue.id, userId: user.id },
           context,
         ),
-      ).rejects.toThrow("An unexpected error occurred");
+      ).rejects.toThrow("audit failed");
     } finally {
       auditLogCreateSpy.mockRestore();
     }
@@ -534,7 +541,7 @@ describe("MCP public API tools", () => {
       additionalProperties: false,
     };
     const datasetExpectedOutputSchema = {
-      type: "object",
+      type: ["object", "null"],
       properties: { answer: { type: "string" } },
       required: ["answer"],
       additionalProperties: false,
@@ -602,7 +609,7 @@ describe("MCP public API tools", () => {
         },
         context,
       ),
-    ).rejects.toThrow("Validation failed");
+    ).rejects.toMatchObject({ name: "ZodError" });
 
     const conflictingDatasetName = `mcp-dataset-conflict-${uuidv4()}`;
     await handleUpsertDataset({ name: conflictingDatasetName }, context);
@@ -635,6 +642,85 @@ describe("MCP public API tools", () => {
       context,
     )) as { id: string; datasetName: string };
     expect(datasetItem.datasetName).toBe(renamedDatasetName);
+
+    await expect(
+      handleUpsertDatasetItem(
+        {
+          datasetId: dataset.id,
+          id: datasetItem.id,
+          expectedOutput: null,
+        },
+        context,
+      ),
+    ).resolves.toMatchObject({ expectedOutput: null });
+
+    const firstBatchItemId = uuidv4();
+    const batchResult = (await handleBatchUpsertDatasetItems(
+      {
+        datasetId: dataset.id,
+        items: [
+          {
+            id: firstBatchItemId,
+            input: { question: "first batch question" },
+            expectedOutput: { answer: "first batch answer" },
+          },
+          {
+            input: { question: "second batch question" },
+            expectedOutput: { answer: "second batch answer" },
+          },
+        ],
+      },
+      context,
+    )) as {
+      data: Array<{ id: string; input: unknown; url: string }>;
+    };
+    expect(batchResult.data).toHaveLength(2);
+    expect(batchResult.data[0]).toMatchObject({
+      id: firstBatchItemId,
+      input: { question: "first batch question" },
+      url: expect.stringContaining(firstBatchItemId),
+    });
+
+    await expect(
+      handleBatchUpsertDatasetItems(
+        {
+          datasetId: dataset.id,
+          items: [
+            {
+              id: firstBatchItemId,
+              input: { question: "updated batch question" },
+              expectedOutput: null,
+            },
+          ],
+        },
+        context,
+      ),
+    ).resolves.toMatchObject({
+      data: [
+        {
+          id: firstBatchItemId,
+          input: { question: "updated batch question" },
+          expectedOutput: null,
+        },
+      ],
+    });
+
+    await expect(
+      handleBatchUpsertDatasetItems(
+        { datasetId: dataset.id, items: [] },
+        context,
+      ),
+    ).rejects.toMatchObject({ name: "ZodError" });
+
+    await expect(
+      handleBatchUpsertDatasetItems(
+        {
+          datasetId: dataset.id,
+          items: Array.from({ length: 101 }, () => ({ input: {} })),
+        },
+        context,
+      ),
+    ).rejects.toMatchObject({ name: "ZodError" });
 
     const datasetItems = (await handleListDatasetItems(
       { datasetId: dataset.id, page: 1, limit: 10 },

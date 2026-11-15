@@ -14,6 +14,20 @@ describe("classifyMediaValue", () => {
       contentType: "image/png",
       mediaId: "cc48838a-3da8-4ca4-a007-2cf8df930e69",
       referenceString: ref,
+      source: "bytes",
+    });
+  });
+
+  it("preserves the field-size-limit source for warning rendering", () => {
+    const oversizedFieldRef =
+      "@@@langfuseMedia:type=text/plain|id=oversized-field|source=field_size_limit@@@";
+
+    expect(classifyMediaValue(oversizedFieldRef)).toEqual({
+      kind: "langfuseRef",
+      contentType: "text/plain",
+      mediaId: "oversized-field",
+      referenceString: oversizedFieldRef,
+      source: "field_size_limit",
     });
   });
 
@@ -130,6 +144,17 @@ describe("classifyMediaValue", () => {
     ).toBe("audio/mpeg");
   });
 
+  it("classifies S3 media URIs by object extension", () => {
+    expect(classifyMediaValue("s3://media-bucket/path/image.png")).toEqual({
+      kind: "s3",
+      contentType: "image/png",
+      uri: "s3://media-bucket/path/image.png",
+    });
+    expect(
+      classifyMediaValue("s3://media-bucket/path/no-extension"),
+    ).toBeNull();
+  });
+
   it("ignores non-media and malformed inputs", () => {
     expect(classifyMediaValue("https://example.com/page")).toBeNull();
     expect(classifyMediaValue("just a string")).toBeNull();
@@ -157,6 +182,7 @@ describe("classifyMediaValue", () => {
           contentType: "image/png",
           mediaId: "cc48838a-3da8-4ca4-a007-2cf8df930e69",
           referenceString: ref,
+          source: "bytes",
         },
       },
       { type: "text", value: '"}' },
